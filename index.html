@@ -1439,6 +1439,7 @@ new GLTFLoader().load('backrooms_assets/chair_mp_1.glb', gltf => {
     m.metalness = 0.08;
     m.envMapIntensity = 1.5;                             // drink in a bit more of the room probe than the walls do
     if (m.color) m.color.multiplyScalar(1.7);            // brighten the near-black wood-stain texture off the floor of the histogram
+    iosSafeMaterial(m);                                  // power-of-two textures so the chair isn't white on iOS Safari
     m.needsUpdate = true;
   });
   scene.add(chair);
@@ -1454,7 +1455,30 @@ function lampFromGltf(gltf) {
   geo.applyMatrix4(mesh.matrixWorld);
   return { geo, mat: mesh.material };
 }
-const loadGLB = file => new Promise((res, rej) => new GLTFLoader().load('backrooms_assets/' + file, res, undefined, rej));
+const loadGLB = file => new Promise((res, rej) => new GLTFLoader().load('backrooms_assets/' + file, gltf => { try { iosSafeGltf(gltf); } catch (e) { console.warn('texture POT pass failed for', file, e); } res(gltf); }, undefined, rej));
+// iOS Safari's WebGL renders materials whose textures are NOT power-of-two as blank/white (desktop GPUs
+// don't care). Several of the GLB textures are NPOT (e.g. the 682x517 wall map), so on load we redraw every
+// texture onto a power-of-two canvas. No-op for textures already POT, so desktop is visually unchanged.
+const powTwoCeil = n => { let p = 1; while (p < n) p <<= 1; return p; };
+function makeTexPOT(tex) {
+  if (!tex || !tex.image) return;
+  const img = tex.image, w = img.width || img.videoWidth || 0, h = img.height || img.videoHeight || 0;
+  if (!w || !h) return;
+  const pw = powTwoCeil(w), ph = powTwoCeil(h);
+  if (pw !== w || ph !== h) {
+    const c = document.createElement('canvas'); c.width = pw; c.height = ph;
+    c.getContext('2d').drawImage(img, 0, 0, pw, ph);   // UVs are 0..1 so a slight aspect change is invisible
+    tex.image = c;
+  }
+  if (MAX_ANISO) tex.anisotropy = Math.min(tex.anisotropy || 1, MAX_ANISO);
+  tex.needsUpdate = true;
+}
+function iosSafeMaterial(mat) {
+  for (const k of ['map', 'emissiveMap', 'roughnessMap', 'metalnessMap', 'normalMap', 'aoMap', 'specularColorMap']) makeTexPOT(mat[k]);
+}
+function iosSafeGltf(gltf) {
+  gltf.scene.traverse(o => { if (o.isMesh && o.material) (Array.isArray(o.material) ? o.material : [o.material]).forEach(iosSafeMaterial); });
+}
 
 // Pull every primitive using the named material out of a loaded GLB, bake world matrices, and merge
 // them into one instanceable geometry. (wall_1/pillar_1 each split into a `wall_3` shaft/face piece and

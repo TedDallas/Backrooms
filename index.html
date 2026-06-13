@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
 <title>THE BACKROOMS</title>
 <!--
   Single-file procedural backrooms — TRUE MULTI-LEVEL.
@@ -21,7 +21,7 @@
 -->
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
-  canvas { display: block; }
+  canvas { display: block; touch-action: none; }
   #ui { position: fixed; inset: 0; pointer-events: none; font-family: "Courier New", monospace; }
   #crosshair { position: absolute; left: 50%; top: 50%; width: 6px; height: 6px; margin: -3px 0 0 -3px;
     border-radius: 50%; background: rgba(20,18,5,0.75); box-shadow: 0 0 0 1px rgba(255,250,210,0.5); }
@@ -38,6 +38,22 @@
   #overlay .keys b { color: #fff4bd; }
   #overlay .enter { margin-top: 26px; font-size: 18px; letter-spacing: 3px; animation: pulse 1.8s ease-in-out infinite; }
   @keyframes pulse { 0%,100% { opacity: .45; } 50% { opacity: 1; } }
+
+  /* --- mobile touch controls (landscape) --- */
+  #mobilectl { position: fixed; inset: 0; pointer-events: none; display: none; z-index: 5; }
+  .mbtn { position: absolute; bottom: max(24px, env(safe-area-inset-bottom)); width: 78px; height: 78px;
+    border-radius: 50%; background: rgba(20,18,5,0.30); border: 2px solid rgba(255,250,210,0.5);
+    color: #f6efbf; font-family: "Courier New", monospace; font-size: 12px; letter-spacing: 1px;
+    display: flex; align-items: center; justify-content: center; pointer-events: auto; user-select: none;
+    -webkit-user-select: none; -webkit-tap-highlight-color: transparent; text-shadow: 0 1px 2px #000; }
+  #btnJump   { right: max(20px, env(safe-area-inset-right)); }
+  #btnCrouch { right: calc(max(20px, env(safe-area-inset-right)) + 92px); }
+  .mbtn.active { background: rgba(255,240,150,0.5); color: #1a1705; border-color: rgba(255,250,210,0.85); }
+  #rotate { position: fixed; inset: 0; display: none; flex-direction: column; align-items: center;
+    justify-content: center; text-align: center; z-index: 20; pointer-events: auto; background: rgba(0,0,0,.93);
+    color: #efe6a8; font-family: "Courier New", monospace; }
+  #rotate .ico { font-size: 46px; margin-bottom: 12px; }
+  #rotate .msg { font-size: 16px; letter-spacing: 2px; }
 </style>
 
 <script type="importmap">
@@ -60,6 +76,11 @@
   </div>
   <div class="enter">CLICK TO ENTER</div>
 </div>
+<div id="mobilectl">
+  <div id="btnCrouch" class="mbtn">CROUCH</div>
+  <div id="btnJump" class="mbtn">JUMP</div>
+</div>
+<div id="rotate"><div class="ico">&#x21BB;</div><div class="msg">ROTATE TO LANDSCAPE</div></div>
 
 <script type="module">
 import * as THREE from 'three';
@@ -1198,9 +1219,84 @@ function processBuildQueue() {
  * ========================================================================== */
 const controls = new PointerLockControls(camera, document.body);
 const overlay = document.getElementById('overlay'), hud = document.getElementById('hud');
-overlay.addEventListener('click', () => controls.lock());
+
+/* --- MOBILE MODE: touch controls + forced-landscape (iPhone et al.) -----------------------------
+ * Detected from the UA / coarse pointer, or forced with #mobile in the URL for desktop testing.
+ * Look = drag on the RIGHT half of the screen; move = virtual joystick on the LEFT half; two
+ * translucent buttons (crouch toggle + jump) sit in the bottom-right. PointerLockControls (mouse
+ * look) is bypassed entirely — we drive camera.rotation (YXZ euler) directly. */
+const MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+  || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)         // iPadOS reports as Mac
+  || (window.matchMedia && window.matchMedia('(pointer: coarse)').matches)
+  || location.hash.includes('mobile');                                            // force-on for testing
+let mobileActive = false, mobileCrouch = false, mobileJumpReq = false;
+const mobileInput = { f: 0, r: 0, mag: 0 };   // f/r = unit move direction (forward/right), mag = 0..1 deflection
+let mYaw = 0, mPitch = 0;                      // live look angles while in mobile mode
+const rotateEl = document.getElementById('rotate');
+function updateOrientation() {                 // iOS can't lock orientation via API -> prompt to rotate when portrait
+  if (rotateEl) rotateEl.style.display = (mobileActive && window.innerHeight > window.innerWidth) ? 'flex' : 'none';
+}
+function startMobile() {
+  if (!mobileActive) {
+    mobileActive = true;
+    camera.rotation.order = 'YXZ';
+    mYaw = camera.rotation.y; mPitch = camera.rotation.x;
+    document.getElementById('mobilectl').style.display = 'block';
+  }
+  overlay.style.display = 'none';
+  startAudio();
+  const el = document.documentElement;                                            // best-effort fullscreen + landscape lock (works on Android/Chrome; iOS Safari falls back to the rotate prompt)
+  if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
+  if (screen.orientation && screen.orientation.lock) screen.orientation.lock('landscape').catch(() => {});
+  updateOrientation();
+}
+overlay.addEventListener('click', () => { if (MOBILE) startMobile(); else controls.lock(); });
 controls.addEventListener('lock', () => { overlay.style.display = 'none'; startAudio(); });
 controls.addEventListener('unlock', () => { overlay.style.display = 'flex'; });
+if (MOBILE) {                                  // tailor the splash copy for touch
+  const k = document.querySelector('#overlay .keys'), en = document.querySelector('#overlay .enter');
+  if (k) k.innerHTML = '<b>LEFT</b> half &mdash; move &nbsp;&nbsp; <b>RIGHT</b> half &mdash; look &nbsp;&nbsp; <b>BUTTONS</b> &mdash; crouch / jump';
+  if (en) en.textContent = 'TAP TO ENTER';
+}
+if (MOBILE) {                                  // touch handlers: per-touch ids let one finger move while another looks
+  const cv = renderer.domElement, LOOK_SENS = 0.0042, JOY_R = 70;                 // JOY_R px from the touch origin = full-speed deflection
+  let moveId = null, lookId = null, mSX = 0, mSY = 0, lLX = 0, lLY = 0;
+  const resetMove = () => { mobileInput.f = mobileInput.r = mobileInput.mag = 0; };
+  cv.addEventListener('touchstart', e => {
+    e.preventDefault();
+    for (const t of e.changedTouches) {
+      if (t.clientX < window.innerWidth / 2 && moveId === null) { moveId = t.identifier; mSX = t.clientX; mSY = t.clientY; resetMove(); }
+      else if (t.clientX >= window.innerWidth / 2 && lookId === null) { lookId = t.identifier; lLX = t.clientX; lLY = t.clientY; }
+    }
+  }, { passive: false });
+  cv.addEventListener('touchmove', e => {
+    e.preventDefault();
+    for (const t of e.changedTouches) {
+      if (t.identifier === moveId) {                                              // left joystick: direction + magnitude from the touch origin
+        const dx = t.clientX - mSX, dy = t.clientY - mSY, len = Math.hypot(dx, dy);
+        mobileInput.mag = Math.min(len / JOY_R, 1);
+        if (len > 1) { mobileInput.f = -dy / len; mobileInput.r = dx / len; } else { mobileInput.f = mobileInput.r = 0; }
+      } else if (t.identifier === lookId) {                                       // right drag: turn (yaw) + look up/down (pitch)
+        mYaw -= (t.clientX - lLX) * LOOK_SENS;
+        mPitch = Math.max(-1.5, Math.min(1.5, mPitch - (t.clientY - lLY) * LOOK_SENS));
+        lLX = t.clientX; lLY = t.clientY;
+        camera.rotation.set(mPitch, mYaw, 0);
+      }
+    }
+  }, { passive: false });
+  const endTouch = e => {
+    for (const t of e.changedTouches) {
+      if (t.identifier === moveId) { moveId = null; resetMove(); }
+      else if (t.identifier === lookId) lookId = null;
+    }
+  };
+  cv.addEventListener('touchend', endTouch);
+  cv.addEventListener('touchcancel', endTouch);
+  const bj = document.getElementById('btnJump'), bc = document.getElementById('btnCrouch');
+  const press = (el, fn) => { el.addEventListener('touchstart', e => { e.preventDefault(); fn(); }, { passive: false }); el.addEventListener('click', fn); };
+  press(bj, () => { mobileJumpReq = true; });                                     // momentary: consumed once in updateMovement
+  press(bc, () => { mobileCrouch = !mobileCrouch; bc.classList.toggle('active', mobileCrouch); }); // toggle
+}
 const keys = new Set();
 // --- debug free-fly camera (no pointer lock needed): G toggles; WASD/QE move, arrows look ---
 let flyMode = false;
@@ -1278,19 +1374,22 @@ function updateMovement(dt) {
   camera.getWorldDirection(fwd); fwd.y = 0; fwd.normalize();
   rgt.set(1, 0, 0).applyQuaternion(camera.quaternion); rgt.y = 0; rgt.normalize();
   let fy = camera.position.y - eye;   // recover feet with the eye offset that produced the current camera height (keeps ground-snap exact through a crouch)
-  const crouching = rmbDown;   // hold right mouse button to crouch (drives eye height, crawl speed, and FOV below). RMB avoids the browser stealing Ctrl+W.
+  const crouching = mobileActive ? mobileCrouch : rmbDown;   // desktop: hold RMB; mobile: the CROUCH button toggles. Drives eye height, crawl speed, and FOV below.
 
-  const f = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
-  const r = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
+  // movement input: keyboard (±1 per axis) on desktop, joystick (unit dir + 0..1 deflection) on mobile
+  let f, r, moveScale = 1;
+  if (mobileActive) { f = mobileInput.f; r = mobileInput.r; moveScale = mobileInput.mag; }
+  else { f = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0); r = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0); }
   if (f || r) {
     let vx = fwd.x * f + rgt.x * r, vz = fwd.z * f + rgt.z * r;
     const gait = crouching ? CROUCH_SPEED : (keys.has('ShiftLeft') || keys.has('ShiftRight') ? SPRINT : 1); // crouch crawl overrides sprint — you can't run while sneaking
-    const len = Math.hypot(vx, vz) || 1, spd = WALK * gait * dt;
-    [camera.position.x, camera.position.z] = moveWithCollision(camera.position.x, camera.position.z, vx / len * spd, vz / len * spd, fy, eye);  // eye = live head clearance: crouch (RMB) to duck under low stair soffits
+    const len = Math.hypot(vx, vz) || 1, spd = WALK * gait * dt * moveScale;   // mobile joystick scales speed by deflection; desktop moveScale stays 1
+    [camera.position.x, camera.position.z] = moveWithCollision(camera.position.x, camera.position.z, vx / len * spd, vz / len * spd, fy, eye);  // eye = live head clearance: crouch (RMB / button) to duck under low stair soffits
   }
 
   // vertical
-  if (grounded && keys.has('Space')) { vy = JUMP; grounded = false; }
+  if (grounded && (keys.has('Space') || mobileJumpReq)) { vy = JUMP; grounded = false; }
+  mobileJumpReq = false;   // consume the mobile JUMP tap (no auto-repeat / double jump)
   vy -= GRAVITY * dt; if (vy < -TERMINAL) vy = -TERMINAL;
   let nfy = fy + vy * dt;
   const g = groundAt(camera.position.x, camera.position.z, fy + STEP_UP);
@@ -1316,7 +1415,8 @@ function updateHUD(dt) {
     hud.textContent = `FPS ${fps}  |  floor ${F}  |  ${ZONE_NAMES[zoneAt(gx, gz)]}  |  cell ${gx},${gz}  |  seed ${SEED}`;
   }
 }
-window.addEventListener('resize', () => { camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); });
+window.addEventListener('resize', () => { camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); updateOrientation(); });
+window.addEventListener('orientationchange', updateOrientation);
 
 { const gy = groundAt(camera.position.x, camera.position.z, 0.5); camera.position.y = (isFinite(gy) ? gy : 0) + EYE; }
 
@@ -1388,7 +1488,7 @@ let frameErrLogged = false;
 function frame() {
   const now = performance.now(); let dt = (now - prevT) / 1000; prevT = now; if (dt > 0.05) dt = 0.05;
   try {
-    if (controls.isLocked) updateMovement(dt);
+    if (controls.isLocked || mobileActive) updateMovement(dt);
     updateStreaming(); processBuildQueue(); flickerTick(now / 1000); lightUniforms.uTime.value = now / 1000; updateHUD(dt);
     renderer.render(scene, camera);
   } catch (e) {   // never let one bad frame kill the render loop (a thrown error stops requestAnimationFrame -> looks like a hard freeze)

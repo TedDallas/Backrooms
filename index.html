@@ -615,6 +615,32 @@ renderer.toneMappingExposure = 1.0;                   // overall exposure dial (
 document.body.appendChild(renderer.domElement);
 const MAX_ANISO = renderer.capabilities.getMaxAnisotropy();
 
+// On-screen diagnostics (append #diag to the URL). Surfaces WebGL caps, shader compile/link errors, and
+// loaded-texture state directly on the page, so mobile browsers can be debugged without a desktop inspector.
+const DIAG = location.hash.includes('diag');
+let dlog = () => {};
+if (DIAG) {
+  const d = document.createElement('div');
+  d.style.cssText = 'position:fixed;left:0;top:0;max-width:100%;max-height:60%;overflow:auto;z-index:60;background:rgba(0,0,0,.82);color:#9f9;font:10px/1.35 monospace;padding:5px;white-space:pre-wrap;pointer-events:none';
+  document.body.appendChild(d);
+  dlog = (...a) => { d.textContent += a.map(x => x === undefined ? 'undef' : String(x)).join(' ') + '\n'; };
+  const oe = console.error, ow = console.warn;
+  console.error = (...a) => { dlog('ERR', a.map(String).join(' ')); oe.apply(console, a); };
+  console.warn = (...a) => { dlog('WARN', a.map(String).join(' ')); ow.apply(console, a); };
+  window.addEventListener('error', e => dlog('JS', e.message));
+  window.addEventListener('unhandledrejection', e => dlog('REJ', (e.reason && e.reason.message) || e.reason));
+  renderer.debug.onShaderError = (gl, prog, vs, fs) => {
+    dlog('SHADER FAIL', (gl.getProgramInfoLog(prog) || '').trim(), '| FS:', (gl.getShaderInfoLog(fs) || '').slice(0, 240).trim(), '| VS:', (gl.getShaderInfoLog(vs) || '').slice(0, 120).trim());
+  };
+  try {
+    const gl = renderer.getContext(), dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    dlog('GL', gl.getParameter(gl.VERSION));
+    if (dbg) dlog('GPU', gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL));
+    dlog('maxTexSize', gl.getParameter(gl.MAX_TEXTURE_SIZE), '| varyings', gl.getParameter(gl.MAX_VARYING_VECTORS),
+         '| fragUnif', gl.getParameter(gl.MAX_FRAGMENT_UNIFORM_VECTORS), '| texUnits', gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS));
+  } catch (e) { dlog('cap err', e.message); }
+}
+
 const FOG_COLOR = new THREE.Color(0x5b5430);   // darker olive haze: distance fades into gloom rather than a bright yellow wash
 const scene = new THREE.Scene();
 scene.background = FOG_COLOR;
@@ -1558,6 +1584,7 @@ const structLoad = USE_GLB_WALLS
       const wf = geoByMaterial(wg, 'wall_3'), wb = geoByMaterial(wg, 'door_frame_wood_1');
       const ps = geoByMaterial(pg, 'wall_3'), pb = geoByMaterial(pg, 'door_frame_wood_1');
       wallGlbGeo = wf.geo; wallGlbMat = wf.mat; installPoolLight(wallGlbMat);   // wall_3 shared by wall faces + pillar shafts + corner inner face
+      if (DIAG) { const t = wallGlbMat.map, im = t && t.image; dlog('wallMat', wallGlbMat.type, '| map', !!t, '| img', im && (im.constructor.name + ' ' + (im.width || 0) + 'x' + (im.height || 0)), '| cs', t && t.colorSpace, '| hasUV', !!(wallGlbGeo && wallGlbGeo.attributes.uv)); }
       pillarGlbGeo = ps.geo;
       wallBaseGeo = wb.geo; pillarBaseGeo = pb.geo;
       baseGlbMat = wb.mat; installPoolLight(baseGlbMat);                        // door_frame_wood shared by all baseboards

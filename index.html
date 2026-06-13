@@ -1,0 +1,1478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>THE BACKROOMS</title>
+<!--
+  Single-file procedural backrooms — TRUE MULTI-LEVEL.
+  Double-click to run (needs internet for the three.js CDN). If your browser blocks
+  ES-module loading from file://, serve the folder:  python -m http.server
+
+  Stacked flat floors connected by stairwells that cut holes through the slabs.
+  Variable ceilings (normal / 2-story / multi-story atriums). Open & droppable: no rails,
+  you can fall into atriums and stairwells (no damage). Connected themed zones:
+    NORMAL  — ordinary maze of rooms + corridors (the connective tissue)
+    ATRIUM  — frequent tall multi-storey voids / light-wells you can drop into
+    PILLARS — open columned halls with eerily repeating (deja-vu) layouts
+    WRONG   — long corridors + abrupt ceiling-height jumps
+	BENDS — bendy maze with no stairs and no direct ways through
+	
+-->
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  canvas { display: block; }
+  #ui { position: fixed; inset: 0; pointer-events: none; font-family: "Courier New", monospace; }
+  #crosshair { position: absolute; left: 50%; top: 50%; width: 6px; height: 6px; margin: -3px 0 0 -3px;
+    border-radius: 50%; background: rgba(20,18,5,0.75); box-shadow: 0 0 0 1px rgba(255,250,210,0.5); }
+  #hud { position: absolute; left: 10px; top: 8px; color: #f6efbf; font-size: 12px; letter-spacing: .5px;
+    text-shadow: 0 1px 2px #000; background: rgba(0,0,0,.25); padding: 4px 8px; border-radius: 4px; }
+  #overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; text-align: center; pointer-events: auto; cursor: pointer; user-select: none;
+    color: #efe6a8; background: radial-gradient(circle at 50% 40%, rgba(120,110,40,.35), rgba(0,0,0,.85)); }
+  #overlay h1 { font-family: "Courier New", monospace; font-size: 44px; letter-spacing: 10px; margin: 0 0 6px;
+    color: #fff4bd; text-shadow: 0 0 18px rgba(255,240,150,.55); }
+  #overlay .sub { font-family: "Courier New", monospace; opacity: .85; margin-bottom: 26px; }
+  #overlay .keys { font-family: "Courier New", monospace; font-size: 14px; line-height: 1.9; opacity: .9;
+    border-top: 1px solid rgba(239,230,168,.25); padding-top: 16px; }
+  #overlay .keys b { color: #fff4bd; }
+  #overlay .enter { margin-top: 26px; font-size: 18px; letter-spacing: 3px; animation: pulse 1.8s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: .45; } 50% { opacity: 1; } }
+</style>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="ui"><div id="crosshair"></div><div id="hud">loading…</div></div>
+<div id="overlay">
+  <h1>THE&nbsp;BACKROOMS</h1>
+  <div class="sub">level 0 &middot; you noclipped out of reality</div>
+  <div class="keys">
+    <b>W A S D</b> &nbsp;move &nbsp;&nbsp; <b>MOUSE</b> &nbsp;look &nbsp;&nbsp; <b>SHIFT</b> &nbsp;run &nbsp;&nbsp; <b>SPACE</b> &nbsp;jump<br/>
+    <b>ESC</b> &nbsp;pause &nbsp;&nbsp; <b>H</b> &nbsp;toggle debug &nbsp;&nbsp; <b>CTRL&#8209;R</b> &nbsp;new level
+  </div>
+  <div class="enter">CLICK TO ENTER</div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+/* ============================================================================
+ * CONFIG
+ * ========================================================================== */
+const CELL = 4;                 // metres per grid cell
+const STORY_H = 4;              // floor-to-floor height
+const CEIL_NORMAL = STORY_H;    // ceiling sits at the next floor's level (no plenum gap to see through)
+const WALL_THICK = 0.25, COL_W = 0.46; // column a touch wider than the walls it sits in
+const SLAB = 0.35, SLAB_EPS = 0.012; // structural floor thickness + a hair of clearance so the dropped ceiling never z-fights the slab underside
+const CHUNK = 8;                // cells per chunk edge
+const RENDER_RADIUS = 2;        // chunks around player (=> 5x5)
+const FLOORS_BELOW = 6, FLOORS_ABOVE = 4; // vertical render window. BELOW = VPER so a full-height atrium/stairwell renders to the bottom when viewed from its top (lower if FPS drops)
+const BUILD_BUDGET_MS = 2.0;    // per-frame time budget for streaming-in chunk-floors: a boundary crossing needs ~55 builds, so they're queued and amortised across frames instead of all built in one (the source of the movement hitch). Nearest-first, so any pop-in is at the far render rim.
+const PLAYER_R = 0.34, EYE = 1.7;
+const CROUCH_EYE = 0.95;        // eye height while right mouse button is held (feet stay on the floor; only the view drops)
+const CROUCH_RATE = 14;         // how fast the view eases between standing and crouched (per second; higher = snappier)
+const CROUCH_SPEED = 0.25;      // crawl speed as a fraction of WALK while crouched (quiet sneaking; overrides sprint)
+const FOV = 75, CROUCH_FOV = 60; // crouching narrows the view: less peripheral vision (intended unease) + a tighter look at what you're avoiding. Eased like the eye height.
+const WALK = 3.6, SPRINT = 1.9, JUMP = 5.2;
+const GRAVITY = 22, STEP_UP = 0.55, SNAP_DOWN = 0.55, TERMINAL = 40;
+const STAIR_PROB = 0.16;        // chance a room hosts a stair up to the floor capping it (per room)
+// Stairs are GLB models (see the stairwells section + rendering): a straight solid concrete flight for
+// 1-storey rooms, stacked switchback stairwell units for taller rooms. Both have 10 risers per storey
+// (STORY_H/10 = 0.4 m, under STEP_UP) and fill a 1x2-cell footprint wall-to-wall. No rails anywhere.
+const STAIR_THICK = 0.5;        // approx slab thickness of a switchback flight/landing: its underside (soffit) sits ~this far below its top walking surface. Walk-UNDER is allowed wherever that soffit clears the player's eye — so the high flights pass standing, and CROUCHING (lower eye, hold RMB) ducks you under the low half-landing/east-end soffits (~1.73 m) that block when standing. Standing eye (EYE=1.7) + STAIR_THICK = 2.2 m of headroom required, matching the old fixed clearance.
+const S5_LEN = 4.077;           // stairs_5_concrete.glb native length (m) -> scaled to span the 2-cell run
+const S5_SCALE = (2 * CELL) / S5_LEN;
+const TALL_BLOCK = 3;           // footprint of tall rooms / atriums (cells); also the stair footprint
+const VPER = 6;                 // vertical tiling period (floors): rooms are 1..6 storeys; floors === 0 (mod VPER) are always solid
+const LIGHT_BROKEN = 0.20, LIGHT_FLICKER = 0.29; // dead lamps = seed < BROKEN (20%); flickering = BROKEN..FLICKER (~9%). Keep FLICKER > BROKEN or the flicker band vanishes.
+// Procedurally BAKED lighting: a per-instance brightness (dead-lamp dimming pools + wall/corner AO) computed
+// deterministically at chunk-build time and stored in instanceColor.g, read by the surface shaders. No
+// realtime lights or shadow maps — the cost is paid once per chunk build (and amortised by the streamer).
+const BAKE_LAMP_R2 = 30;        // lamp influence radius^2 (m^2): how far a fixture's pool reaches
+const BAKE_AO = 0.5;            // ambient-occlusion of the pool where boxed in by maze walls (corners darkest)
+const POOL_GAIN = 0.30;         // strength of the baked lamp-pool light added (as emissive) to floors/walls. Trimmed to compensate for the higher room fill above, so lit surfaces stay ~as bright while the dark FLOOR of brightness (what props get) rises. Lower = gloomier/moodier pools.
+const ZONE_SIZE = 16;           // cells per zone tile (the SPECIAL zones: atrium/pillars/wrong)
+const NZONE = 32;               // coarse grid for NORMAL & BENDS regions (2x linear = 4x area of a special tile): big sprawling regions
+const NORMAL_BIG_P = 0.52;      // share of coarse tiles that are one large NORMAL region
+const BENDS_BIG_P = 0.18;       // ... and one large BENDS region (also coarse-grid, ~NORMAL size, to hold a well-formed maze). Rest subdivide into specials
+const P_WALL_NORMAL = 0.50;     // NORMAL maze wall density (per continuous wall RUN). Higher = denser rooms / more closed cells
+const NRUN_MIN = 4, NRUN_SPAN = 8; // NORMAL walls run continuously for NRUN_MIN..NRUN_MIN+NRUN_SPAN-1 cells -> unbroken corridor walls
+// BENDS = long winding corridors via spatially-varying FLOW: each FLOW_BLK-sized block channels movement
+// either E-W or N-S (low wall density ALONG the flow, high ACROSS it), and the flow flips block-to-block, so
+// a corridor runs long in one direction then bends into the next block's direction. No stairs/atriums/arterials.
+const BENDS_FLOW_BLK = 7;       // block size (cells) over which the flow direction is constant -> ~corridor segment length before a bend
+const BENDS_OPEN = 0.34;        // wall density ALONG the flow. Raised + closer to CROSS -> a tighter, more uniform braided maze (less wide-open) that still has a mild directional flow for winding
+const BENDS_CROSS = 0.50;       // wall density ACROSS the flow -> ~1-wide corridors. Lower this for more cross-links (more open/looser); raise for tighter
+const CORNER_P_BENDS = 1.00;    // BENDS rounds EVERY eligible (checkerboard) corner -> curved by default, right angles minimised
+const ART = 10;                 // arterial corridor spacing (cells): guarantees global connectivity. Wider => much longer corridors + longer unbroken walls between the open thoroughfares
+const NORMAL_CARVE_P = 0.6;     // fraction of NORMAL's fully-sealed cells that get a carve opening; the rest stay genuinely closed (closed rooms). Player still reaches the world via the arterial backbone
+const FOG_DENSITY = 0.045;
+
+const SEED = (() => { const m = location.hash.match(/seed=(-?\d+)/); return m ? (parseInt(m[1], 10) >>> 0) : 1337; })();
+
+/* ============================================================================
+ * HASH
+ * ========================================================================== */
+function hashInt(x, y, salt) {
+  let h = (2166136261 ^ SEED) >>> 0;
+  h = Math.imul(h ^ (x | 0), 16777619);
+  h = Math.imul(h ^ (y | 0), 16777619);
+  h = Math.imul(h ^ (salt | 0), 16777619);
+  h ^= h >>> 13; h = Math.imul(h, 0x5bd1e995); h ^= h >>> 15;
+  return h >>> 0;
+}
+const hash01 = (x, y, salt) => hashInt(x, y, salt) / 4294967296;
+const fdiv = (a, b) => Math.floor(a / b);
+const fmod = (a, b) => ((a % b) + b) % b;
+
+const SALT_E = 11, SALT_N = 22, SALT_CARVE = 33, SALT_ZONE = 44, SALT_TALL = 55, SALT_STAIR = 66, SALT_LIGHT = 77, SALT_STAIRROT = 88, SALT_CORNER = 111, SALT_ZONE2 = 122, SALT_RUNX = 133, SALT_RUNZ = 144, SALT_CARVE2 = 155, SALT_FLOW = 166;
+const CORNER_P_NORMAL = 0.60;          // chance an eligible even/even inside-corner gets the rounded-corner model (NORMAL zones) — bumped for a more curvy NORMAL
+const CORNER_P_ODD = 0.14;             // ... rarer in PILLARS / WRONG zones (0 in ATRIUM / elsewhere)
+const FLOORMIX = 0x9e3779b1;            // mixes the floor index into per-floor salts
+const fsalt = (base, F) => (base ^ Math.imul(F | 0, FLOORMIX)) | 0;
+
+/* ============================================================================
+ * ZONES  (low-frequency themed regions; NORMAL is the connective tissue)
+ * ========================================================================== */
+const Z_NORMAL = 0, Z_ATRIUM = 1, Z_PILLARS = 2, Z_WRONG = 3, Z_BENDS = 4;
+const ZONE_NAMES = ['NORMAL', 'ATRIUM', 'PILLARS', 'WRONG', 'BENDS'];
+// Two tiers so NORMAL regions are ~4x the area of a special: a COARSE grid (NZONE) first claims big
+// NORMAL blocks; whatever's left subdivides on the FINE grid (ZONE_SIZE) into atrium/pillars/wrong/bends.
+function zoneAt(gx, gz) {
+  const c = hash01(fdiv(gx, NZONE), fdiv(gz, NZONE), SALT_ZONE);   // coarse tier: big NORMAL & BENDS regions
+  if (c < NORMAL_BIG_P) return Z_NORMAL;
+  if (c < NORMAL_BIG_P + BENDS_BIG_P) return Z_BENDS;
+  const r = hash01(fdiv(gx, ZONE_SIZE), fdiv(gz, ZONE_SIZE), SALT_ZONE2);  // fine tier: the rest -> atrium/pillars/wrong
+  if (r < 0.40) return Z_ATRIUM;
+  if (r < 0.73) return Z_PILLARS;
+  return Z_WRONG;
+}
+
+/* ============================================================================
+ * VERTICAL TILING  (each TALL_BLOCK column's floors are tiled in periods of VPER
+ *  into stacked rooms of 1..6 storeys; floors === 0 (mod VPER) are ALWAYS solid)
+ * ========================================================================== */
+// pattern[pos] = storeys if pos is a room base, 0 if void (open volume above a taller room).
+// Each pattern is a COMPOSITION of VPER(=6): an s-storey room at pos p is followed by s-1
+// voids, so the next base lands exactly on pos p+s. This is what guarantees a stair's landing
+// floor (the room's cap) is always solid — see the stairwells section.
+const PV_1   = [1, 1, 1, 1, 1, 1];           // six single-storey rooms (the common case)
+const PV_2a  = [2, 0, 1, 1, 1, 1];
+const PV_2b  = [1, 1, 2, 0, 1, 1];
+const PV_22  = [2, 0, 2, 0, 1, 1];
+const PV_222 = [2, 0, 2, 0, 2, 0];
+const PV_3   = [3, 0, 0, 1, 1, 1];
+const PV_32  = [3, 0, 0, 2, 0, 1];
+const PV_33  = [3, 0, 0, 3, 0, 0];
+const PV_4   = [4, 0, 0, 0, 1, 1];
+const PV_42  = [4, 0, 0, 0, 2, 0];
+const PV_5   = [5, 0, 0, 0, 0, 1];
+const PV_6   = [6, 0, 0, 0, 0, 0];           // one cathedral-height atrium spanning the whole period
+function tallPattern(bx, bz, k) {
+  const X0 = bx * TALL_BLOCK, Z0 = bz * TALL_BLOCK, zc = zoneAt(X0 + 1, Z0 + 1);
+  if (zc === Z_PILLARS) return PV_1;             // pillar halls: uniform single-storey ceiling (no gaps)
+  // BENDS (and any room block straddling a BENDS seam — a 3x3 block can cross the 16-cell zone grid) is
+  // uniformly single-storey, so no atrium/tall room ever pokes into the corridor maze. Corners checked too.
+  if (zc === Z_BENDS || zoneAt(X0, Z0) === Z_BENDS || zoneAt(X0 + 2, Z0) === Z_BENDS || zoneAt(X0, Z0 + 2) === Z_BENDS || zoneAt(X0 + 2, Z0 + 2) === Z_BENDS) return PV_1;
+  const r = hash01(bx, bz, fsalt(SALT_TALL, k));
+  if (zc === Z_ATRIUM)                           // frequent tall light-wells, up to 6 storeys
+    return r < 0.16 ? PV_1 : r < 0.30 ? PV_6  : r < 0.42 ? PV_5  : r < 0.56 ? PV_42 :
+           r < 0.68 ? PV_4 : r < 0.80 ? PV_33 : r < 0.90 ? PV_32 : PV_222;
+  if (zc === Z_WRONG)                            // abrupt ceiling-height jumps
+    return r < 0.45 ? PV_1  : r < 0.60 ? PV_2a : r < 0.72 ? PV_22 : r < 0.82 ? PV_3 :
+           r < 0.90 ? PV_33 : r < 0.96 ? PV_4  : PV_6;
+  return r < 0.72 ? PV_1 : r < 0.82 ? PV_2a : r < 0.90 ? PV_2b : r < 0.96 ? PV_3 : r < 0.99 ? PV_33 : PV_42; // mostly normal
+}
+function roomStoriesAt(gx, gz, F) {       // 0 => void cell, else storeys of the room based here
+  const bx = fdiv(gx, TALL_BLOCK), bz = fdiv(gz, TALL_BLOCK), k = fdiv(F, VPER);
+  return tallPattern(bx, bz, k)[fmod(F, VPER)];
+}
+function roomBaseFloor(gx, gz, F) {        // floor the room occupying (cell,F) is based on
+  const bx = fdiv(gx, TALL_BLOCK), bz = fdiv(gz, TALL_BLOCK), k = fdiv(F, VPER), pat = tallPattern(bx, bz, k);
+  for (let p = fmod(F, VPER); p >= 0; p--) if (pat[p] !== 0) return VPER * k + p;
+  return VPER * k;                         // unreachable (pos 0 is always a base)
+}
+const ceilStoriesH = s => CEIL_NORMAL + (s - 1) * STORY_H;   // 4 / 8 / 12 / 16 / 20 / 24
+
+/* ============================================================================
+ * STAIRWELLS  (per-room: a stair climbs a room's full height to the solid floor
+ *  that caps it, on a 1x2-cell footprint inside the room's TALL_BLOCK. A 1-storey
+ *  room gets one straight solid flight (stairs_5_concrete.glb); a taller room gets
+ *  one switchback stairwell unit PER STOREY (stairs_mp_1.glb) stacked into a real
+ *  stairwell. The landing floor is always solid — see the composition note above.)
+ * ========================================================================== */
+const repX = bx => bx * TALL_BLOCK, repZ = bz => bz * TALL_BLOCK;  // a representative cell of column (bx,bz)
+function roomHasStairRaw(bx, bz, Fb) {     // Fb must be a room base; pure hash gate (no cross-floor deps)
+  if (roomStoriesAt(repX(bx), repZ(bz), Fb) === 0) return false;
+  if (zoneAt(bx * TALL_BLOCK + 1, bz * TALL_BLOCK + 1) === Z_BENDS) return false;  // BENDS: no stairs (corridor maze only)
+  return hash01(bx, bz, fsalt(SALT_STAIR, Fb)) < STAIR_PROB;
+}
+// Effective stair: never put one in a room whose floor IS the landing/cutout of the stair beneath it.
+// Also, OUTSIDE the WRONG ("weird") zone, suppress a stair whose foot or top would sit over a void — keep
+// both ends on real floor so the stair is enterable and doesn't lead to / come from a ledge. WRONG keeps the
+// odd ones (deliberate disorientation). The entry/exit solidity test is `stairEndsSolid` (defined below).
+function roomHasStair(bx, bz, Fb) {
+  if (!roomHasStairRaw(bx, bz, Fb)) return false;
+  if (roomHasStairRaw(bx, bz, roomBaseFloor(repX(bx), repZ(bz), Fb - 1))) return false;
+  if (zoneAt(bx * TALL_BLOCK + 1, bz * TALL_BLOCK + 1) === Z_WRONG) return true;
+  return stairEndsSolid(bx, bz, Fb);
+}
+// A stair is defined in a canonical orientation (climbing +x) then rotated about the centre of its
+// TALL_BLOCK footprint by r*90deg (r 0..3), deterministically per room. rot2 forward-rotates an offset
+// (a,b) measured from the footprint centre — works for both integer cell offsets and continuous metres.
+function stairRot(bx, bz, Fb) { return hashInt(bx, bz, fsalt(SALT_STAIRROT, Fb)) & 3; }
+function rot2(a, b, r) {
+  return r === 0 ? [a, b] : r === 1 ? [-b, a] : r === 2 ? [-a, -b] : [b, -a];
+}
+const invRot2 = (a, b, r) => rot2(a, b, (4 - r) & 3);
+// Both ends of the stair land on real floor (no ledge): the ENTRY is the cell west of the footprint (canonical
+// (-1,0) — the foot of the climb, in the neighbour block) at base Fb; the EXIT is the in-block step-off cell at
+// the cap (canonical (2,0) for the straight flight, (0,1) for the switchback stack) at Fb+H. `w` is the same
+// centre-rotation the rendering/exit-edge use. Pure roomStoriesAt only (no stair calls) — no recursion into
+// roomHasStair. The exit is already solid by the vertical composition; the entry is the one that can be a void.
+function stairEndsSolid(bx, bz, Fb) {
+  const H = roomStoriesAt(repX(bx), repZ(bz), Fb), r = stairRot(bx, bz, Fb), X0 = repX(bx), Z0 = repZ(bz);
+  const w = c => { const [u, v] = rot2(c[0] - 1, c[1] - 1, r); return [X0 + u + 1, Z0 + v + 1]; };
+  const [ex, ez] = w([-1, 0]), [xx, xz] = w(H <= 1 ? [2, 0] : [0, 1]);
+  return roomStoriesAt(ex, ez, Fb) !== 0 && roomStoriesAt(xx, xz, Fb + H) !== 0;
+}
+// Classify a cell of the stair based at (column, Fb): null, or {H, kind, r}. kind 'S' = the straight
+// 1-storey flight, 'W' = a stack of switchback units (one per storey). Both kinds occupy canonical
+// cells (0,0) and (1,0) of the 3x3 block, entered from the west edge; the world cell is
+// inverse-rotated into that canonical frame to classify it.
+function stairKind(gx, gz, Fb) {
+  const bx = fdiv(gx, TALL_BLOCK), bz = fdiv(gz, TALL_BLOCK);
+  if (!roomHasStair(bx, bz, Fb)) return null;
+  const H = roomStoriesAt(repX(bx), repZ(bz), Fb), r = stairRot(bx, bz, Fb);
+  const [cu, cv] = invRot2(fmod(gx, TALL_BLOCK) - 1, fmod(gz, TALL_BLOCK) - 1, r);
+  if (cv !== -1 || cu > 0) return null;                            // canonical cells (0,0),(1,0) only (block centre at 1,1)
+  return { H, kind: H <= 1 ? 'S' : 'W', r };
+}
+const stairRunCell = (gx, gz, Fb) => stairKind(gx, gz, Fb) !== null;     // any cell the stair body occupies
+const stairCutCell = stairRunCell;         // cells holed through the capping floor: the whole footprint (the climber tops out flush with the cap inside it)
+// Hole punched in floor F by the stair in the room directly below (which caps exactly at F).
+function stairCutout(gx, gz, F) {
+  const below = roomBaseFloor(repX(fdiv(gx, TALL_BLOCK)), repZ(fdiv(gz, TALL_BLOCK)), F - 1);
+  const H = roomStoriesAt(repX(fdiv(gx, TALL_BLOCK)), repZ(fdiv(gz, TALL_BLOCK)), below);
+  if (below + H !== F) return false;
+  return stairCutCell(gx, gz, below);
+}
+// Canonical metres of a world point in the stair's (rotated) footprint frame: x' 0..2*CELL runs
+// west->east along the climb axis, z' 0..CELL across it. Shared by stairSurface and stairBlocked.
+function stairCanon(gx, gz, x, z, r) {
+  const bx = fdiv(gx, TALL_BLOCK), bz = fdiv(gz, TALL_BLOCK);
+  const Cx = (repX(bx) + 1.5) * CELL, Cz = (repZ(bz) + 1.5) * CELL;   // block centre
+  const [qx, qz] = invRot2(x - Cx, z - Cz, r);
+  return [qx + 1.5 * CELL, qz + 1.5 * CELL];
+}
+// Walking surface of the stair based at Fb at or below yMax, at point (x,z) in run cell (gx,gz); null
+// if none fits under yMax. QUANTIZED to the models' real treads (10 risers of STORY_H/10 per storey)
+// so the feet sit flush on what is rendered.
+//   'S' straight: one flight climbing +x across the 2-cell run (first riser just past the model's
+//       back-skirt offset), topping out flush with the cap.
+//   'W' switchback unit (one per storey, stacked): flight A climbs +x in the NORTH lane (z' >= CELL/2)
+//       from x' = 2C/3, the half landing (u = SH/2) fills the east end full-width, flight B returns -x
+//       in the SOUTH lane onto the storey landing (u = SH) covering the west end. The stack level used
+//       is the highest whose surface still fits under yMax; the cap-level landing also covers the
+//       north-lane entry zone up to the first riser (x' < 2C/3 — the model's landing is CUT OUT past
+//       that, it's the open stairwell mouth, so don't let anyone walk on air there).
+function stairSurface(gx, gz, x, z, Fb, yMax = Infinity) {
+  const k = stairKind(gx, gz, Fb);
+  if (!k) return null;
+  const SH = STORY_H, base = Fb * SH, riser = SH / 10;
+  const [xp, zp] = stairCanon(gx, gz, x, z, k.r);
+  const clampN = (v, n) => v < 0 ? 0 : v > n ? n : v;
+  if (k.kind === 'S') {
+    const s = base + riser * clampN(Math.ceil((xp - 0.077 * S5_SCALE) / (0.4 * S5_SCALE)), 10);
+    return s <= yMax ? s : null;
+  }
+  const tread = (2 * CELL) / 15;                                     // 5 risers per flight over 2C/3 m of run
+  const u = zp >= CELL / 2
+    ? riser * clampN(Math.ceil((xp - (2 * CELL) / 3) / tread), 5)            // flight A: 0 -> SH/2
+    : SH / 2 + riser * clampN(Math.ceil(((4 * CELL) / 3 - xp) / tread), 5);  // flight B: SH/2 -> SH
+  const lvl = Math.min(k.H - 1, Math.floor((yMax - base - u) / SH));
+  let best = lvl >= 0 ? base + lvl * SH + u : null;
+  if (zp >= CELL / 2 && xp < (2 * CELL) / 3 && base + k.H * SH <= yMax)      // cap landing over the entry zone
+    best = Math.max(best ?? -Infinity, base + k.H * SH);
+  return best;
+}
+// SMOOTH collision/walking surface of the stair: identical structure to stairSurface but each climbing
+// flight is a CONTINUOUS RAMP (base -> base+SH linearly over its run) instead of discrete treads, so the
+// player glides up/down as if on an incline rather than bumping riser by riser. The ramp meets the entry
+// floor flush (u=0 at the west entry) and each landing flush (half/storey/cap are flat, identical to
+// stairSurface), so a whole stacked well is bump-free end to end. The invisible first-person feet ride up
+// to ~half a riser below the rendered nosings mid-step (no avatar, so it's unseen). BOTH groundAt and
+// stairBlocked read this, which keeps them self-consistent — a normal climb advances the ramp by only
+// slope*step (< STEP_UP) so it's never self-blocked, even sprinting. stairSurface stays the model-accurate
+// (quantized) field that _verify_stairs.mjs checks against the actual GLB triangles.
+function stairRamp(gx, gz, x, z, Fb, yMax = Infinity) {
+  const k = stairKind(gx, gz, Fb);
+  if (!k) return null;
+  const SH = STORY_H, base = Fb * SH;
+  const [xp, zp] = stairCanon(gx, gz, x, z, k.r);
+  const clamp01 = v => v < 0 ? 0 : v > 1 ? 1 : v;
+  if (k.kind === 'S') {                                              // straight flight: linear base -> base+SH over the run
+    const x0 = 0.077 * S5_SCALE, run = 10 * 0.4 * S5_SCALE;         // first riser foot -> last nose (passes through every nose)
+    const s = base + SH * clamp01((xp - x0) / run);
+    return s <= yMax ? s : null;
+  }
+  const run = (2 * CELL) / 3;                                        // each switchback flight's horizontal run (5 risers)
+  const u = zp >= CELL / 2
+    ? (SH / 2) * clamp01((xp - (2 * CELL) / 3) / run)                // flight A north lane: 0 -> SH/2 (then flat half landing)
+    : SH / 2 + (SH / 2) * clamp01(((4 * CELL) / 3 - xp) / run);      // flight B south lane: SH/2 -> SH (then flat storey landing)
+  const lvl = Math.min(k.H - 1, Math.floor((yMax - base - u) / SH));
+  let best = lvl >= 0 ? base + lvl * SH + u : null;
+  if (zp >= CELL / 2 && xp < (2 * CELL) / 3 && base + k.H * SH <= yMax)      // cap landing over the entry zone
+    best = Math.max(best ?? -Infinity, base + k.H * SH);
+  return best;
+}
+// The two world cells the climber's step-off edge separates, for the stair based at (bx,bz,Fb); else null.
+function stairExitEdge(bx, bz, Fb) {
+  if (!roomHasStair(bx, bz, Fb)) return null;
+  const H = roomStoriesAt(repX(bx), repZ(bz), Fb), r = stairRot(bx, bz, Fb), X0 = repX(bx), Z0 = repZ(bz);
+  // canonical: the straight flight steps +x from cell (1,0) to (2,0); a switchback stack tops out on
+  // its full-width landing at the west end and steps +z from cell (0,0) to (0,1). Both land in-block,
+  // where the cap floor is guaranteed solid by the pattern composition.
+  const [c1, c2] = H <= 1 ? [[1, 0], [2, 0]] : [[0, 0], [0, 1]];
+  const w = c => { const [u, v] = rot2(c[0] - 1, c[1] - 1, r); return [X0 + u + 1, Z0 + v + 1]; };
+  return [w(c1), w(c2)];
+}
+// The step-off edge where a stair below emerges onto floor F must stay open (else the climber is trapped).
+function stairExitOpen(gx, gz, dir, F) {   // dir 'E' (east wall of gx,gz) | 'N' (north wall of gx,gz)
+  const bx = fdiv(gx, TALL_BLOCK), bz = fdiv(gz, TALL_BLOCK);
+  const below = roomBaseFloor(repX(bx), repZ(bz), F - 1), H = roomStoriesAt(repX(bx), repZ(bz), below);
+  if (below + H !== F) return false;
+  const e = stairExitEdge(bx, bz, below);
+  if (!e) return false;
+  const q1 = [gx, gz], q2 = dir === 'E' ? [gx + 1, gz] : [gx, gz + 1];   // edge the query names
+  const eq = (a, b) => a[0] === b[0] && a[1] === b[1];
+  return (eq(q1, e[0]) && eq(q2, e[1])) || (eq(q1, e[1]) && eq(q2, e[0]));
+}
+
+const floorSolidAt = (gx, gz, F) => roomStoriesAt(gx, gz, F) !== 0 && !stairCutout(gx, gz, F);
+
+// Ceiling lights sit on even cells; each lights its 2x2 ceiling block. A light is "broken" (dead)
+// deterministically from its cell + floor. roomStoriesAt/stairCutCell gate it to cells that actually
+// carry a panel. Used to darken the ceiling around dead lights (the surrounding-gloom effect).
+function lampBrokenAt(gx, gz, F) {
+  const pcx = gx - fmod(gx, 2), pcz = gz - fmod(gz, 2);                 // the even cell whose panel lights this block
+  if (roomStoriesAt(pcx, pcz, F) === 0 || stairCutCell(pcx, pcz, F)) return false;
+  return hash01(pcx, pcz, fsalt(SALT_LIGHT, F)) < LIGHT_BROKEN;
+}
+
+/* ============================================================================
+ * MAZE  (per-floor walls, zone-flavoured; open-room suppression; carve)
+ * ========================================================================== */
+function densEast(Z)  { return Z === Z_PILLARS ? 0.12 : Z === Z_WRONG ? 0.16 : 0.42; }
+function densNorth(Z) { return Z === Z_PILLARS ? 0.12 : Z === Z_WRONG ? 0.60 : 0.42; } // WRONG => long E-W corridors
+// BENDS flow: 0 = corridors run E-W in this block (few E walls, many N walls), 1 = run N-S. Flips per block.
+const bendsFlow = (gx, gz) => hashInt(fdiv(gx, BENDS_FLOW_BLK), fdiv(gz, BENDS_FLOW_BLK), SALT_FLOW) & 1;
+const densEastBends  = (gx, gz) => bendsFlow(gx, gz) === 0 ? BENDS_OPEN : BENDS_CROSS;   // E walls cross an E-W flow -> few; channel an N-S flow -> many
+const densNorthBends = (gx, gz) => bendsFlow(gx, gz) === 0 ? BENDS_CROSS : BENDS_OPEN;
+// Run-based maze (NORMAL & BENDS): walls decided per CONTINUOUS RUN rather than per cell, so a wall persists
+// unbroken along its line for NRUN_MIN..NRUN_MIN+NRUN_SPAN-1 cells -> LONG corridors that follow the long
+// walls and turn at run boundaries (winding). A vertical (N-S) wall at column gx is constant for a run of gz;
+// a horizontal (E-W) wall at row gz is constant for a run of gx. A per-line phase staggers the runs so they
+// don't align into a grid; variable gaps between wall lines give variable-width corridors. `p` = wall density.
+function weRun(gx, gz, F, p) {                             // vertical wall segment at column gx (extends along gz)
+  const k = hashInt(gx, 0x51, fsalt(SALT_RUNX, F)), rl = NRUN_MIN + (k & (NRUN_SPAN - 1)), ph = (k >>> 4) % rl;
+  return hash01(gx, fdiv(gz + ph, rl), fsalt(SALT_E, F)) < p;
+}
+function wnRun(gx, gz, F, p) {                             // horizontal wall segment at row gz (extends along gx)
+  const k = hashInt(gz, 0x51, fsalt(SALT_RUNZ, F)), rl = NRUN_MIN + (k & (NRUN_SPAN - 1)), ph = (k >>> 4) % rl;
+  return hash01(fdiv(gx + ph, rl), gz, fsalt(SALT_N, F)) < p;
+}
+function weRaw(gx, gz, F) {
+  const Z = zoneAt(gx, gz);
+  if (Z === Z_NORMAL) return weRun(gx, gz, F, P_WALL_NORMAL);
+  if (Z === Z_BENDS)  return hash01(gx, gz, fsalt(SALT_E, F)) < densEastBends(gx, gz);  // flow-channelled long winding corridors
+  let ax = gx, az = gz;
+  if (Z === Z_PILLARS) { ax = fmod(gx, 6); az = fmod(gz, 6); }   // deja-vu: repeating 6x6 layout
+  return hash01(ax, az, fsalt(SALT_E, F)) < densEast(Z);
+}
+function wnRaw(gx, gz, F) {
+  const Z = zoneAt(gx, gz);
+  if (Z === Z_NORMAL) return wnRun(gx, gz, F, P_WALL_NORMAL);
+  if (Z === Z_BENDS)  return hash01(gx, gz, fsalt(SALT_N, F)) < densNorthBends(gx, gz);
+  let ax = gx, az = gz;
+  if (Z === Z_PILLARS) { ax = fmod(gx, 6); az = fmod(gz, 6); }
+  return hash01(ax, az, fsalt(SALT_N, F)) < densNorth(Z);
+}
+function sealed(gx, gz, F) { return weRaw(gx, gz, F) && weRaw(gx - 1, gz, F) && wnRaw(gx, gz, F) && wnRaw(gx, gz - 1, F); }
+const carveDir = (gx, gz, F) => hashInt(gx, gz, fsalt(SALT_CARVE, F)) % 4;
+// Whether a fully-sealed cell actually punches its guaranteed opening. Non-NORMAL zones always do (their old
+// behaviour: nothing stays fully closed). NORMAL leaves a fraction sealed -> real closed rooms; the player
+// still reaches everything else via the arterial backbone, so this can't trap them.
+function carveOpens(gx, gz, F) {
+  return zoneAt(gx, gz) !== Z_NORMAL || hash01(gx, gz, fsalt(SALT_CARVE2, F)) < NORMAL_CARVE_P;
+}
+function weCarved(gx, gz, F) {
+  if (!weRaw(gx, gz, F)) return false;
+  if (sealed(gx, gz, F)     && carveOpens(gx, gz, F)     && carveDir(gx, gz, F)     === 0) return false;
+  if (sealed(gx + 1, gz, F) && carveOpens(gx + 1, gz, F) && carveDir(gx + 1, gz, F) === 1) return false;
+  return true;
+}
+function wnCarved(gx, gz, F) {
+  if (!wnRaw(gx, gz, F)) return false;
+  if (sealed(gx, gz, F)     && carveOpens(gx, gz, F)     && carveDir(gx, gz, F)     === 2) return false;
+  if (sealed(gx, gz + 1, F) && carveOpens(gx, gz + 1, F) && carveDir(gx, gz + 1, F) === 3) return false;
+  return true;
+}
+// "open rooms": interiors of tall rooms (atriums) and pillar halls have no inner walls
+function openGroup(gx, gz, F) {
+  const Fb = roomBaseFloor(gx, gz, F);
+  if (roomStoriesAt(gx, gz, Fb) >= 2) return 'T' + fdiv(gx, TALL_BLOCK) + '_' + fdiv(gz, TALL_BLOCK) + '_' + Fb;
+  if (zoneAt(gx, gz) === Z_PILLARS)   return 'P' + F;
+  return null;
+}
+function sameOpen(ax, az, bx, bz, F) { const g = openGroup(ax, az, F); return g !== null && g === openGroup(bx, bz, F); }
+function wallEastRoom(gx, gz, F) {
+  if (stairRunCell(gx, gz, F) || stairRunCell(gx + 1, gz, F)) return false; // keep stairs reachable
+  if (stairExitOpen(gx, gz, 'E', F)) return false;                          // stair below steps off across this edge
+  if (stairCutout(gx, gz, F) && stairCutout(gx + 1, gz, F)) return false;   // both cells are one stairwell mouth: a wall here would float over the shaft
+  if (fmod(gz, ART) === 0 && zoneAt(gx, gz) !== Z_BENDS) return false;      // arterial row -> open E-W corridor (BENDS has none: purely winding)
+  if (sameOpen(gx, gz, gx + 1, gz, F)) return false;
+  return weCarved(gx, gz, F);
+}
+function wallNorthRoom(gx, gz, F) {
+  if (stairRunCell(gx, gz, F) || stairRunCell(gx, gz + 1, F)) return false;
+  if (stairExitOpen(gx, gz, 'N', F)) return false;                          // stair below steps off across this edge
+  if (stairCutout(gx, gz, F) && stairCutout(gx, gz + 1, F)) return false;   // no wall floating across the stairwell mouth
+  if (fmod(gx, ART) === 0 && zoneAt(gx, gz) !== Z_BENDS) return false;      // arterial column -> open N-S corridor (BENDS has none: purely winding)
+  if (sameOpen(gx, gz, gx, gz + 1, F)) return false;
+  return wnCarved(gx, gz, F);
+}
+// Grid columns; dense in pillar halls; none in BENDS (pillars appear only as wall-end caps, wallEndAt).
+// F matters at stairs: the stair models fill their cells wall-to-wall, so any column on a stair
+// footprint's rim is suppressed for that room's whole span (render AND collision stay in agreement).
+function columnAt(gx, gz, F) {
+  const Z = zoneAt(gx, gz);
+  if (Z === Z_BENDS) return false;
+  if (Z !== Z_PILLARS && (((gx & 1) !== 0) || ((gz & 1) !== 0))) return false;
+  for (let a = -1; a <= 0; a++) for (let b = -1; b <= 0; b++)
+    if (stairRunCell(gx + a, gz + b, roomBaseFloor(gx + a, gz + b, F))) return false;
+  return true;
+}
+// A wall terminating at grid vertex (vx,vz) with nothing else meeting it: exactly ONE of the four
+// incident edge-slots is a wall (W/E horizontal + S/N vertical). A free end like this leaves the wall
+// model's two thin face planes exposed, showing the gap between them — so we cap it with a pillar.
+// Pure; used render-side only (collision keeps using columnAt), so it can't affect connectivity.
+// IMPORTANT: count only RENDERED walls. A wall is drawn only by an owning cell that is a real room base
+// at F (the wall loop skips void cells, sA===0). The void floors of a tall room (atrium shaft) still carry
+// phantom wall bits but draw no wall -> without this gate they spawned end-cap pillars floating in the void.
+function wallEndAt(vx, vz, F) {
+  const rendW = (gx, gz, fn) => roomStoriesAt(gx, gz, F) > 0 && fn(gx, gz, F);  // owning cell is a room base AND has the wall
+  const n = (rendW(vx - 1, vz - 1, wallNorthRoom) ? 1 : 0) + (rendW(vx, vz - 1, wallNorthRoom) ? 1 : 0)   // W, E
+          + (rendW(vx - 1, vz - 1, wallEastRoom) ? 1 : 0) + (rendW(vx - 1, vz, wallEastRoom) ? 1 : 0);     // S, N
+  return n === 1;
+}
+
+/* ============================================================================
+ * WORLD QUERIES FOR THE PLAYER  (pure — also exercised by the Node test)
+ * ========================================================================== */
+// Highest walkable surface at (x,z) not above yMax (used for gravity/ground snap).
+function groundAt(x, z, yMax) {
+  const gx = fdiv(x, CELL), gz = fdiv(z, CELL), F0 = Math.round(yMax / STORY_H);
+  let best = -Infinity;
+  for (let F = F0 + 1; F >= F0 - VPER; F--) {     // scan deep enough to catch a tall stair based well below
+    if (floorSolidAt(gx, gz, F)) { const y = F * STORY_H; if (y <= yMax && y > best) best = y; }
+    const s = stairRamp(gx, gz, x, z, F, yMax); // smooth incline (not the quantized treads): picks the right level of a stacked switchback well
+    if (s !== null && s > best) best = s;
+  }
+  return best;
+}
+// Wall test at a given feet height (uses the room occupying that height).
+function wallXAt(gx, gz, sign, fy) {
+  const F = Math.round(fy / STORY_H), a = sign > 0 ? gx : gx - 1;
+  return wallEastRoom(a, gz, roomBaseFloor(a, gz, F));
+}
+function wallZAt(gx, gz, sign, fy) {
+  const F = Math.round(fy / STORY_H), a = sign > 0 ? gz : gz - 1;
+  return wallNorthRoom(gx, a, roomBaseFloor(gx, a, F));
+}
+// Horizontal collision with the stair BODIES, for a move into (tx,tz) at feet height fy with `head` m of
+// clearance above the feet (the player's live eye height — lower while crouched). Tested against the SMOOTH
+// ramp surface (stairRamp — the same surface groundAt rides), so climbing is never self-blocked. The
+// straight flight is a solid concrete wedge (closed sides): nothing above the feet is enterable, it can only
+// be mounted from its foot. A switchback unit is open underneath (thin flight/landing slabs), so you can
+// WALK UNDER it wherever the soffit clears your head: a slab blocks only when its top surface is above
+// fy+STEP_UP (can't step over) AND its underside (top - STAIR_THICK) is below fy+head (can't fit under) — so
+// the high flights pass standing and crouching ducks you under the low half-landing/east-end soffits. It also
+// has a full-height divider wall between its two lanes (native z +-1.2 -> canonical x' 0.6C..1.4C) that can't
+// be crossed mid-flight, only rounded at the landings. All per stack level, so tall wells work.
+function stairBlocked(fx, fz, tx, tz, fy, head = EYE) {
+  const gx = fdiv(tx, CELL), gz = fdiv(tz, CELL), F0 = Math.round(fy / STORY_H);
+  for (let F = F0 + 1; F >= F0 - VPER; F--) {
+    const k = stairKind(gx, gz, F);
+    if (!k) continue;
+    if (fy < F * STORY_H - 0.01) continue;                  // on a floor below this stair's room: its body is above that ceiling
+    if (k.kind === 'S') {                                   // solid wedge: never entered, only climbed (ramp surface, same as the ground the player rides)
+      const s = stairRamp(gx, gz, tx, tz, F, Infinity);
+      return s !== null && s > fy + STEP_UP;
+    }
+    if (fy < (F + k.H) * STORY_H - 0.01) {                  // centre divider wall (full height of every unit)
+      const [txp, tzp] = stairCanon(gx, gz, tx, tz, k.r);
+      const [, fzp] = stairCanon(gx, gz, fx, fz, k.r);
+      if ((tzp - CELL / 2) * (fzp - CELL / 2) < 0 && txp >= 0.6 * CELL && txp <= 1.4 * CELL) return true;
+    }
+    const s = stairRamp(gx, gz, tx, tz, F, fy + head + STAIR_THICK);   // lowest slab whose soffit would meet the head; clears overhead -> walk under
+    return s !== null && s > fy + STEP_UP;
+  }
+  return false;
+}
+// Stairs read as their real bodies: groundAt rides the SMOOTH ramp (stairRamp — the tread-nose incline, so
+// climbing/descending glides instead of bumping riser by riser) while stairBlocked stops the player entering
+// a flight's solid flank, the straight stair's wedge, or crossing a switchback's centre divider — both
+// agree because the ramp sits at/above the quantized treads stairBlocked tests, so a normal climb (next
+// surface <= a step up) is never blocked. The space beneath elevated flights/landings stays freely
+// walkable (crouch to duck under the low half-landing/east-end soffits — `head` carries the eye height).
+function moveWithCollision(x, z, dx, dz, fy, head = EYE) {
+  let nx = x + dx;
+  if (dx !== 0) {
+    const sign = dx > 0 ? 1 : -1, gx = fdiv(x, CELL);
+    const gzLo = fdiv(z - PLAYER_R, CELL), gzHi = fdiv(z + PLAYER_R, CELL);
+    let blocked = false;
+    for (let gz = gzLo; gz <= gzHi; gz++) if (wallXAt(gx, gz, sign, fy)) { blocked = true; break; }
+    if (blocked) nx = sign > 0 ? Math.min(nx, (gx + 1) * CELL - PLAYER_R) : Math.max(nx, gx * CELL + PLAYER_R);
+    if (stairBlocked(x, z, nx, z, fy, head)) nx = x;
+  }
+  let nz = z + dz;
+  if (dz !== 0) {
+    const sign = dz > 0 ? 1 : -1, gz = fdiv(z, CELL);
+    const gxLo = fdiv(nx - PLAYER_R, CELL), gxHi = fdiv(nx + PLAYER_R, CELL);
+    let blocked = false;
+    for (let gx = gxLo; gx <= gxHi; gx++) if (wallZAt(gx, gz, sign, fy)) { blocked = true; break; }
+    if (blocked) nz = sign > 0 ? Math.min(nz, (gz + 1) * CELL - PLAYER_R) : Math.max(nz, gz * CELL + PLAYER_R);
+    if (stairBlocked(nx, z, nx, nz, fy, head)) nz = z;
+  }
+  const cgx = fdiv(nx, CELL), cgz = fdiv(nz, CELL), colF = Math.round(fy / STORY_H);
+  for (let ox = 0; ox <= 1; ox++) for (let oz = 0; oz <= 1; oz++) {
+    const cxx = cgx + ox, czz = cgz + oz;
+    if (!columnAt(cxx, czz, colF)) continue;
+    const wx = cxx * CELL, wz = czz * CELL, half = COL_W / 2 + PLAYER_R, ddx = nx - wx, ddz = nz - wz;
+    if (Math.abs(ddx) < half && Math.abs(ddz) < half) {
+      if (half - Math.abs(ddx) < half - Math.abs(ddz)) nx = wx + (ddx >= 0 ? half : -half);
+      else nz = wz + (ddz >= 0 ? half : -half);
+    }
+  }
+  return [nx, nz];
+}
+// Spawn on a solid arterial intersection (always 4-way open) in a calm zone (NORMAL/PILLARS), near origin,
+// and NEVER on a stair footprint (else the player materialises inside a flight). Debug: append #at=gx,gz to
+// spawn at an exact cell (floor 0) — e.g. #seed=1337&at=44,-2.
+const SPAWN_AT = (() => { const m = location.hash.match(/at=(-?\d+),(-?\d+)/); return m ? [parseInt(m[1], 10), parseInt(m[2], 10)] : null; })();
+function findSpawn() {
+  if (SPAWN_AT) return { x: (SPAWN_AT[0] + 0.5) * CELL, z: (SPAWN_AT[1] + 0.5) * CELL };
+  const want = Z => Z === Z_NORMAL || Z === Z_PILLARS;
+  for (let r = 0; r <= 80; r++)
+    for (let j = -r; j <= r; j++) for (let i = -r; i <= r; i++) {
+      if (Math.max(Math.abs(i), Math.abs(j)) !== r) continue;
+      const gx = i * ART, gz = j * ART;
+      if (want(zoneAt(gx, gz)) && floorSolidAt(gx, gz, 0) && !stairKind(gx, gz, 0))   // floor 0 is always a room base, so Fb = 0
+        return { x: (gx + 0.5) * CELL, z: (gz + 0.5) * CELL };
+    }
+  return { x: CELL / 2, z: CELL / 2 };
+}
+
+/* ============================================================================
+ * RENDERER / SCENE / CAMERA
+ * ========================================================================== */
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;   // filmic roll-off: bright lamp pools highlight instead of clipping to flat white -> a more realistic, gloomier image
+renderer.toneMappingExposure = 1.0;                   // overall exposure dial (lower = darker/gloomier)
+document.body.appendChild(renderer.domElement);
+const MAX_ANISO = renderer.capabilities.getMaxAnisotropy();
+
+const FOG_COLOR = new THREE.Color(0x5b5430);   // darker olive haze: distance fades into gloom rather than a bright yellow wash
+const scene = new THREE.Scene();
+scene.background = FOG_COLOR;
+scene.fog = new THREE.FogExp2(FOG_COLOR.getHex(), FOG_DENSITY);
+
+const camera = new THREE.PerspectiveCamera(FOV, window.innerWidth / window.innerHeight, 0.1, 300);
+const SPAWN = findSpawn();
+camera.position.set(SPAWN.x, EYE, SPAWN.z);
+
+scene.add(new THREE.HemisphereLight(0xfff6c8, 0x9a8b3f, 0.32));  // subtle top-down gradient on top of the IBL probe below; kept dim so the room stays gloomy
+const ambient = new THREE.AmbientLight(0xfff3c0, 0.10); scene.add(ambient);   // tiny flat floor so nothing is pure black; the environment probe does the real ambient work
+const hemi = scene.children.find(o => o.isHemisphereLight);
+
+// --- Image-based lighting (IBL) -----------------------------------------------------------------
+// The scene previously had NO environment, so PBR models (chair, lamp housings — all metalness:0,
+// roughness:1, dark textures) had nothing to reflect and rendered as flat black silhouettes no
+// matter how much flat fill was added. This dim equirectangular gradient stands in for the room's
+// bounced light: a warm luminous band overhead (the fluorescent ceiling), fading through a dingy
+// dark horizon to a deep-red glow below (the red carpet bouncing up). PMREM-blurred into an
+// irradiance+reflection probe on scene.environment so EVERY MeshStandardMaterial — procedural
+// surfaces AND imported props — gets realistic soft ambient plus reflections. Specular reflection
+// is independent of a surface's (dark) albedo, so this is what lifts the models off pure black and
+// balances the lighting. Baked once at startup -> no realtime-light/shadow cost (web-friendly).
+function makeRoomEnv() {
+  const c = document.createElement('canvas'); c.width = 16; c.height = 256;
+  const x = c.getContext('2d'), g = x.createLinearGradient(0, 0, 0, 256);  // v: top row = straight up, bottom row = straight down
+  g.addColorStop(0.00, '#a89a6e');   // up: warm luminous ceiling glow
+  g.addColorStop(0.20, '#5f5739');
+  g.addColorStop(0.45, '#322d1c');
+  g.addColorStop(0.52, '#2a2417');   // horizon: dingy and dim
+  g.addColorStop(0.75, '#2a1310');
+  g.addColorStop(1.00, '#330d0a');   // down: deep red carpet bounce
+  x.fillStyle = g; x.fillRect(0, 0, 16, 256);
+  const t = new THREE.CanvasTexture(c);
+  t.mapping = THREE.EquirectangularReflectionMapping;
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+try {
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  const src = makeRoomEnv();
+  scene.environment = pmrem.fromEquirectangular(src).texture;   // hung on the scene -> auto-applied to all PBR materials that lack their own envMap
+  src.dispose(); pmrem.dispose();
+} catch (e) { console.warn('IBL env setup failed (continuing without it):', e); }
+
+/* ============================================================================
+ * TEXTURES + MATERIALS + GEOMETRIES  (procedural, built once, shared)
+ * ========================================================================== */
+function makeCanvas(s) { const c = document.createElement('canvas'); c.width = c.height = s; return c; }
+function finalize(c, rx, ry) {
+  const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = MAX_ANISO; t.repeat.set(rx, ry); return t;
+}
+function addNoise(g, s, amp, rb) {
+  const img = g.getImageData(0, 0, s, s), d = img.data;
+  for (let i = 0; i < d.length; i += 4) { const n = (Math.random() * 2 - 1) * amp; d[i] += n; d[i + 1] += n * 0.95; d[i + 2] += n * (rb ?? 0.7); }
+  g.putImageData(img, 0, 0);
+}
+function makeCarpet() {
+  const s = 256, c = makeCanvas(s), g = c.getContext('2d');
+  g.fillStyle = '#6e1b1b'; g.fillRect(0, 0, s, s); addNoise(g, s, 12, 0.85);
+  g.globalAlpha = 0.05; for (let k = 0; k < 60; k++) { g.fillStyle = Math.random() < 0.5 ? '#4d1010' : '#8a2c28'; const x = Math.random() * s, y = Math.random() * s; g.beginPath(); g.arc(x, y, 4 + Math.random() * 10, 0, 7); g.fill(); }
+  g.globalAlpha = 1; return finalize(c, 2, 2);
+}
+function makeConcrete() {
+  const s = 256, c = makeCanvas(s), g = c.getContext('2d');
+  g.fillStyle = '#8d8a83'; g.fillRect(0, 0, s, s); addNoise(g, s, 16, 1);
+  g.globalAlpha = 0.07; for (let k = 0; k < 26; k++) { g.fillStyle = Math.random() < 0.5 ? '#6f6c66' : '#a6a39b'; const x = Math.random() * s, y = Math.random() * s; g.beginPath(); g.arc(x, y, 5 + Math.random() * 24, 0, 7); g.fill(); }
+  g.globalAlpha = 0.5; g.strokeStyle = '#6b685f'; g.lineWidth = 1; for (let k = 0; k < 4; k++) { g.beginPath(); g.moveTo(Math.random() * s, 0); g.lineTo(Math.random() * s, s); g.stroke(); } // hairline cracks
+  g.globalAlpha = 1; return finalize(c, 1, 1);
+}
+// --- shared bits for the procedural surface shaders ---
+const injectWorldPos = (shader) => {                 // a world-space position varying (through the instance matrix)
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <common>', '#include <common>\nvarying vec3 vWorldPos;')
+    .replace('#include <begin_vertex>', `#include <begin_vertex>
+      vec4 wW = vec4(transformed, 1.0);
+      #ifdef USE_INSTANCING
+        wW = instanceMatrix * wW;
+      #endif
+      vWorldPos = (modelMatrix * wW).xyz;`);
+};
+const GLSL_NOISE = `                                   // value noise + fbm, shared by the wall & ceiling shaders
+  float wh(vec3 p){ p = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3)); p *= 17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
+  float wn(vec3 x){ vec3 i = floor(x), f = fract(x); f = f*f*(3.0-2.0*f);
+    return mix(mix(mix(wh(i+vec3(0,0,0)), wh(i+vec3(1,0,0)), f.x), mix(wh(i+vec3(0,1,0)), wh(i+vec3(1,1,0)), f.x), f.y),
+               mix(mix(wh(i+vec3(0,0,1)), wh(i+vec3(1,0,1)), f.x), mix(wh(i+vec3(0,1,1)), wh(i+vec3(1,1,1)), f.x), f.y), f.z); }
+  float wfbm(vec3 p){ float a = 0.5, s = 0.0; for (int i = 0; i < 4; i++){ s += a * wn(p); p = p*2.02 + vec3(11.0); a *= 0.5; } return s; }`;
+
+// Walls/columns: dingy wallpaper computed in WORLD space (never tiles/stretches), plus baseboard
+// grime keyed to each wall's OWN floor — the floor height rides in instanceColor.r so the grime
+// stays at the bottom even on a 24m atrium wall. Keeps MeshStandardMaterial (PBR/fog) intact.
+const POOL_TINT = 'vec3(1.0, 0.92, 0.72)';   // warm fluorescent tint for the baked lamp pools (GLSL literal)
+// GLSL snippet: add the baked lamp-pool light (instanceColor.g) to a surface as emissive, so lit pools glow
+// over the dim ambient base. `gain` scales it per surface (ceilings catch less direct light than floors).
+const poolAdd = (gain) => `totalEmissiveRadiance += diffuseColor.rgb * vColor.g * ${gain} * ${POOL_TINT};`;
+
+const wallMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.85 });
+wallMat.onBeforeCompile = (shader) => {
+  injectWorldPos(shader);
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <common>', `#include <common>
+      varying vec3 vWorldPos;
+      float gShade = 1.0;
+      ${GLSL_NOISE}
+      vec3 wallpaper(vec3 wp, float baseY){
+        vec3 base = vec3(0.90, 0.86, 0.62);                 // much lighter, paler yellow
+        float mott  = wfbm(wp * 0.56);                      // all noise freqs doubled -> twice the detail/resolution
+        float grain = wn(wp * 11.0);
+        vec3 col = base * (0.66 + 0.6 * mott);
+        col *= (0.95 + 0.1 * grain);
+        float drip = wfbm(vec3(wp.x * 2.8, wp.y * 0.2, wp.z * 2.8) + 20.0);
+        col = mix(col, col * vec3(0.6, 0.56, 0.43), smoothstep(0.52, 0.82, drip) * 0.5);
+        float h = max(wp.y - baseY, 0.0);                   // height above THIS wall's floor
+        float band = smoothstep(1.7, 0.0, h);               // grime fades out ~1.7m up
+        float gnoise = wfbm(vec3(wp.x * 2.2, h * 1.4, wp.z * 2.2) + 60.0);
+        float grime = clamp(band * (0.4 + 0.9 * gnoise), 0.0, 1.0);
+        col *= (1.0 - 0.6 * grime);
+        gShade = clamp(mott, 0.0, 1.0);
+        return pow(max(col, 0.0), vec3(2.2));               // sRGB-chosen -> linear (renderer is colour-managed)
+      }`)
+    .replace('#include <color_fragment>', '')               // instanceColor.r carries floor height, not a tint
+    .replace('#include <map_fragment>', `#include <map_fragment>
+      diffuseColor.rgb *= wallpaper(vWorldPos, vColor.r);`)
+    .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+      ${poolAdd(POOL_GAIN)}`)                              // instanceColor.g = baked lamp-pool light (additive)
+    .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
+      roughnessFactor = clamp(roughnessFactor * (1.06 - 0.16 * gShade), 0.45, 1.0);`);
+};
+const floorMat = new THREE.MeshStandardMaterial({ map: makeCarpet(), roughness: 0.97, side: THREE.FrontSide });
+floorMat.onBeforeCompile = (shader) => {                 // instanceColor.g = baked lamp-pool light (added as emissive)
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <color_fragment>', '')
+    .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+      ${poolAdd(POOL_GAIN)}`);
+};
+
+// Ceiling: procedural rectangular drop-ceiling tiles in world space — grout lines, per-tile shade,
+// and occasional brown water stains. instanceColor.r dims the 2x2 block beneath a dead light.
+const ceilMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9, side: THREE.FrontSide });
+ceilMat.onBeforeCompile = (shader) => {
+  injectWorldPos(shader);
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <common>', `#include <common>
+      varying vec3 vWorldPos;
+      ${GLSL_NOISE}
+      // Returns the tile+rail albedo and, via out params, the rail mask + brushed-metal factor that the
+      // roughness/emissive passes below reuse (all share this main() scope, evaluated in include order).
+      vec3 ceiling(vec3 wp, out float railMask, out float brush){
+        vec2 tile = vec2(1.2, 0.6);                         // rectangular office tiles (m)
+        vec2 q = wp.xz / tile;
+        vec2 id = floor(q), f = fract(q);
+        vec2 ed = min(f, 1.0 - f) * tile;                   // world distance to nearest grid line (x: cross lines, y: main lines)
+
+        // ---- porous, dingy white tile face -------------------------------------------
+        vec3 face = vec3(0.80, 0.81, 0.82) * (0.86 + 0.28 * wh(vec3(id, 7.0)));  // per-tile tone variation
+        face *= 0.93 + 0.09 * wn(wp * 26.0);                // fine porous speckle (mineral-fibre tile)
+        face *= 1.0 - 0.16 * smoothstep(0.45, 0.95, wfbm(wp * 1.7));            // irregular large-scale dinginess
+        // water stains: pale wetted centre fading OUT to a darker tide-line rim (kept, refined)
+        float stained = step(0.992, wh(vec3(id, 19.0)));    // ~0.8% of tiles stained (rare — less is more)
+        vec2 sc = vec2(wh(vec3(id, 3.0)), wh(vec3(id, 5.0)));
+        vec2 rel = (f - sc) * tile;                         // offset from the stain centre, in metres
+        // domain-warp the sample point with two low-freq fbm fields so the outline grows organic lobes
+        // and fingers (not a disc), then a higher-freq wobble frays the edge -> lots of shape variety.
+        vec2 w2 = vec2(wfbm(wp * 5.0 + 11.0), wfbm(wp * 5.0 + 23.0)) - 0.5;
+        float ragged = 0.78 + 0.6 * wfbm(wp * 13.0);
+        float dist = length(rel + w2 * 0.24) * ragged;
+        float R = 0.30;                                     // nominal stain radius (m)
+        float inside = smoothstep(R, R - 0.06, dist);       // 1 across the wetted patch, fading out at the edge
+        float rim = smoothstep(R - 0.18, R - 0.03, dist);   // rises toward the edge -> a darker tide line at the rim
+        float amt = inside * (0.22 + 0.78 * rim) * (0.82 + 0.18 * wn(wp * 11.0)); // pale wash in the centre, dark at the rim
+        face = mix(face, face * vec3(0.46, 0.38, 0.28), stained * amt);
+
+        // ---- aluminium drop-grid tees, laid OVER the tile ----------------------------
+        float hw = 0.020, soft = 0.005;                     // half-width of the visible tee face (m)
+        float rA = 1.0 - smoothstep(hw - soft, hw + soft, ed.x);   // cross tee   (runs along z, at x grid lines)
+        float rB = 1.0 - smoothstep(hw - soft, hw + soft, ed.y);   // MAIN runner (runs along x, at z grid lines)
+        railMask = max(rA, rB);
+        float onMain = step(rA, rB);                        // main runner dominates (incl. the overlap junctions)
+        float crossTee = rA * (1.0 - rB);                   // exposed cross tee, where it isn't tucked under a main
+        float bev = mix(1.0 - clamp(ed.x / hw, 0.0, 1.0),   // rounded-tee bevel: bright at centre, dark down the flanks
+                        1.0 - clamp(ed.y / hw, 0.0, 1.0), onMain);
+        brush = mix(wn(vec3(wp.z * 55.0, id.x, 0.0)),       // brushed-metal streaks running along the rail length
+                    wn(vec3(wp.x * 55.0, id.y, 9.0)), onMain);
+        vec3 alu = vec3(0.80, 0.82, 0.85);                  // aluminium base albedo (the glossy glint is added in the emissive pass)
+        alu *= 0.82 + 0.30 * brush;                         // brushed tone
+        alu *= 0.55 + 0.45 * bev;                           // bevel shading down the flanks
+        alu = mix(alu, alu * 0.55, crossTee * 0.7);         // cross tee reads darker where it passes under the main runner
+
+        vec3 col = mix(face, alu, railMask);                // rails over the tile face
+        return pow(max(col, 0.0), vec3(2.2));
+      }`)
+    .replace('#include <color_fragment>', '')               // instanceColor.r = dead-light dimming, not a tint
+    .replace('#include <map_fragment>', `#include <map_fragment>
+      float railMask, brush;
+      diffuseColor.rgb *= ceiling(vWorldPos, railMask, brush) * vColor.r;`)
+    .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
+      roughnessFactor = mix(roughnessFactor, 0.30, railMask);`) // tiles stay matte (0.9); the metal rails are glossy
+    .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+      {
+        // Faux polished-aluminium glint. With no env map, real metalness reads black; instead add a tight
+        // view-dependent specular lobe (a virtual key light) that slides along the rails as the camera moves
+        // — cheap, and sells the metal. Gated to the rails, brushed, and dimmed under dead lights (vColor.r).
+        vec3 V = normalize(cameraPosition - vWorldPos);
+        vec3 N = vec3(0.0, -1.0, 0.0);                      // ceiling underside, facing the room
+        vec3 L = normalize(vec3(0.3, -1.0, 0.25));          // virtual key light
+        float ndh = max(dot(N, normalize(L + V)), 0.0);
+        float glint = pow(ndh, 200.0) * (0.35 + 0.65 * brush);
+        totalEmissiveRadiance += vec3(0.95, 0.97, 1.0) * glint * railMask * 1.8 * vColor.r;
+      }
+      ${poolAdd(POOL_GAIN * 0.4)}`);                       // ceilings catch only a little of the lamp pool (they face away)
+};
+
+// Ceiling lights: per-panel state rides in instanceColor.r (a 0..1 seed). Most steady; a few are
+// dead (no glow + dark fixture); a few flicker intermittently. uTime drives the flicker.
+const lightUniforms = { uTime: { value: 0 } };
+// Ceiling light fixtures are GLB models (loaded at startup, before streaming): an "on" model and a
+// permanently-"off" model. Their geometry + material are held module-wide so every chunk-floor instances
+// them. A lamp the old shader rendered dead (seed < LIGHT_BROKEN) now uses the OFF model; everything else
+// uses the ON model. Flickering lamps stay on the ON model and have their emissive modulated on the GPU
+// (the same uTime+seed trick the old procedural troffer used) — no per-frame model swapping.
+const LAMP_SCALE = 1.0;        // fixture size multiplier (native model is ~1.2 m long); bump if they look small in the 4 m cells
+let lampOnGeo = null, lampOnMat = null, lampOffGeo = null, lampOffMat = null;
+// --- experiment: swap the procedural box walls + columns for GLB models -------------------------
+// The placement layer (`walls`/`cols` arrays) is unchanged; only the rendered geometry/material swaps.
+// Flip USE_GLB_WALLS to false to revert to the procedural box walls/columns + manual skirting.
+//   wall_1.glb   : one cell-wide panel (native 4.06 w x 3 h, origin centred-x / bottom-y) -> wall faces.
+//   pillar_1.glb : a 0.46 m (= COL_W) shaft, native 3 m tall, origin centred / bottom-y -> column shaft.
+// Both ship a `wall_3` shaft/face texture (shared) plus their own baked `door_frame_wood` baseboard
+// primitive. We render those model baseboards (at native height, at each foot) IN PLACE OF the old
+// hand-built skirting — so the manual baseboards (walls and pillars) are gone.
+const USE_GLB_WALLS = true;
+const WALL_GLB_W = 4.06, WALL_GLB_H = 3;   // wall face: native width / height -> scaled to cell width & segment height
+const WALL_BASE_W = 4.09;                  // wall baseboard native width -> scaled to cell width
+const PILLAR_GLB_H = 3;                     // pillar shaft native height -> scaled to one storey (footprint already = COL_W)
+let wallGlbGeo = null, wallGlbMat = null;   // wall faces + (shared) wall_3 material, also used for pillar shafts
+let wallBaseGeo = null, pillarGlbGeo = null, pillarBaseGeo = null, baseGlbMat = null;
+// pillar_1_plain_1.glb: a plain (no flared base, no baseboard) shaft used for STACKED / visibly-continuous
+// pillar segments (tall atrium shafts, up the side of a tall wall). The flared pillar_1.glb is kept for
+// segments that rest on a real floor with the slab obscuring what's below. wall_mp_1 -> its own material.
+let pillarPlainGeo = null, pillarPlainMat = null;
+// Zone-specific pillar models: pillar_3.glb (wall_6 shaft + wood_painted_white base) for PILLARS halls;
+// pillar_1_plain_2.glb (thick ~0.8 m brick wall_mp_1 shaft, no base) for ATRIUM pillars, full height.
+let pillar3Geo = null, pillar3Mat = null, pillar3BaseGeo = null, pillar3BaseMat = null;
+let atriumPillarGeo = null, atriumPillarMat = null;
+// wall_1_plain.glb: a plain wall panel (single wall_mp_1 plaster material, no wooden baseboard), same
+// native 4.06 x 3 m as wall_1.glb's faces -> same placement transform. ATRIUM-owned wall segments render
+// with this instead of the default wall_3 panel, for a cleaner look inside the light-wells.
+let atriumWallGeo = null, atriumWallMat = null;
+// wall_1_rounded_corner_1.glb: one-cell L-corner (native 3 m tall) rounding an inside 90deg corner.
+// Three pieces: inner concave face (wall_3, shares wallGlbMat), outer convex face (wall_mp_1, own mat),
+// baseboard (door_frame_wood, shares baseGlbMat). Default orientation rounds the SE corner (S+E edges).
+const CORNER_H = 3;
+let cornerInnerGeo = null, cornerOuterGeo = null, cornerOuterMat = null, cornerBaseGeo = null;
+// Stair models (each one concrete_4 mesh; both 10 risers over a 3 m native rise, scaled to a storey):
+//   stairs_mp_1.glb      : one switchback stairwell unit, native 4 x 6 m — two 4-riser flights around a
+//                          full-height centre divider, a half landing filling the far end, a full-width
+//                          storey landing on top. Scaled (CELL/4, STORY_H/3, CELL/3) -> exactly 1x2
+//                          cells x 1 storey, and stacked one per storey in rooms 2+ storeys tall.
+//   stairs_5_concrete.glb: one straight solid flight, native 2 x 4.077 m, scaled (CELL/2, STORY_H/3,
+//                          S5_SCALE) -> 1x2 cells x 1 storey, for single-storey rooms.
+// stairSurface/stairBlocked in the pure layer mirror these exact layouts — keep them in sync.
+let stairsSGeo = null, stairsSMat = null, stairsWGeo = null, stairsWMat = null;
+function installLampFlicker(mat) {   // inject the intermittent-flicker emissive modulation into the ON lamp's own material
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uTime = lightUniforms.uTime;
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>
+        uniform float uTime;
+        float lh(float x){ return fract(sin(x * 12.9898) * 43758.5453); }`)
+      .replace('#include <color_fragment>', '')               // instanceColor.r = per-lamp state seed, not a tint
+      .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+        float seed = vColor.r;
+        float m = 1.0;
+        if (seed < ${LIGHT_FLICKER.toFixed(3)}) {              // intermittent flicker (dead lamps use the OFF model, so no dead branch here)
+          float ph = seed * 113.0;
+          float bad = lh(floor(uTime * 0.7) + ph);             // drops into a flickery spell now and then
+          float stut = lh(floor(uTime * 12.0) + ph * 1.7);     // rapid stutter while in it
+          m = bad < 0.45 ? step(0.5, stut) : 1.0;
+        }
+        totalEmissiveRadiance *= m;`);
+  };
+}
+const concreteMat = new THREE.MeshStandardMaterial({ map: makeConcrete(), roughness: 1.0 });
+concreteMat.onBeforeCompile = (shader) => {              // instanceColor.g = baked lamp-pool light (slab sides, step risers)
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <color_fragment>', '')
+    .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+      ${poolAdd(POOL_GAIN)}`);
+};
+
+const planeGeo = new THREE.PlaneGeometry(CELL, CELL);
+const wallGeo  = new THREE.BoxGeometry(CELL, CEIL_NORMAL, WALL_THICK); // base height = CEIL_NORMAL; scaled in Y
+const colGeo   = new THREE.BoxGeometry(COL_W, CEIL_NORMAL, COL_W);
+const slabGeo  = new THREE.BoxGeometry(CELL, SLAB, CELL);          // floor slab: carpet top, concrete sides + underside
+const slabMats = [concreteMat, concreteMat, floorMat, concreteMat, concreteMat, concreteMat]; // box face order: +x,-x,+y,-y,+z,-z
+const dummy = new THREE.Object3D();
+const tmpCol = new THREE.Color();
+
+// colorFn(item) -> [r,g,b] optionally writes per-instance data into instanceColor (raw floats, no
+// colour conversion) — used by the shader materials to carry floor height / light state per instance.
+function instanced(geo, mat, list, fn, colorFn) {
+  const m = new THREE.InstancedMesh(geo, mat, list.length);
+  for (let i = 0; i < list.length; i++) {
+    fn(dummy, list[i]); dummy.updateMatrix(); m.setMatrixAt(i, dummy.matrix);
+    if (colorFn) { const c = colorFn(list[i]); tmpCol.r = c[0]; tmpCol.g = c[1]; tmpCol.b = c[2]; m.setColorAt(i, tmpCol); }
+  }
+  m.instanceMatrix.needsUpdate = true;
+  if (m.instanceColor) m.instanceColor.needsUpdate = true;
+  return m;
+}
+
+/* ============================================================================
+ * CHUNK-FLOOR GEOMETRY  (one floor of one chunk; streamed in a vertical window)
+ * ========================================================================== */
+// A ceiling lamp sits at every even/even cell; it's lit unless the hash marks it permanently dead.
+const lampLit = (lx, lz, F) => hash01(lx, lz, fsalt(SALT_LIGHT, F)) >= LIGHT_BROKEN;
+// Deterministic baked brightness for a cell: how well-lit it is by nearby LIVE lamps (so zones full of dead
+// lamps go dim), times an ambient-occlusion term that darkens cells boxed in by maze walls (corners darkest).
+// Returns ~1.0 in open, fully-lit areas and falls toward BAKE_MIN in dead-lamp pockets and tight corners.
+function bakedAt(gx, gz, F) {
+  let lit = 0;
+  const ex = gx - (gx & 1), ez = gz - (gz & 1);           // nearest cell on the even/even lamp grid
+  for (let ox = -4; ox <= 4; ox += 2) for (let oz = -4; oz <= 4; oz += 2) {
+    const lx = ex + ox, lz = ez + oz;
+    if (!lampLit(lx, lz, F)) continue;                     // dead lamps cast no pool -> dead-lamp pockets go dark
+    const dx = (lx - gx) * CELL, dz = (lz - gz) * CELL;
+    lit += BAKE_LAMP_R2 / (BAKE_LAMP_R2 + dx * dx + dz * dz + STORY_H * STORY_H); // lamp is one storey up
+  }
+  let w = 0;                                               // enclosing maze walls -> occlude the pool in corners
+  if (wallEastRoom(gx, gz, F)) w++;
+  if (wallEastRoom(gx - 1, gz, F)) w++;
+  if (wallNorthRoom(gx, gz, F)) w++;
+  if (wallNorthRoom(gx, gz - 1, F)) w++;
+  return lit * (1 - BAKE_AO * (w / 4));                    // additive lamp-pool irradiance (~0..2.5), occluded in corners
+}
+// Rounded-corner placement (PURELY VISUAL — collision still uses the straight wall bits, so connectivity
+// is unchanged). Occasionally an inside L of two perpendicular wall segments is swapped for the rounded
+// corner model. Restricted to EVEN/EVEN cells so two corners can never share (hence double-draw) a wall:
+// a corner consumes only its own cell's edges, which border odd cells that never host corners. Pure fn of
+// (gx,gz,F,SEED). Returns rotation r in {0:SE, 1:SW, 2:NW, 3:NE} (rotation.y = r*PI/2), or -1 for none.
+const cornerProb = Z => Z === Z_BENDS ? CORNER_P_BENDS : Z === Z_NORMAL ? CORNER_P_NORMAL : (Z === Z_PILLARS || Z === Z_WRONG) ? CORNER_P_ODD : 0;
+// Memoised per floor (cleared when F changes): within one buildChunkFloor the BENDS two-pass recursion + the
+// wall-consumed checks ask for the same cell's corner many times, so caching keeps it cheap.
+let _cmF = NaN; const _cm = new Map();
+function cornerAt(gx, gz, F) {
+  if (F !== _cmF) { _cm.clear(); _cmF = F; }
+  const key = gx + ',' + gz, hit = _cm.get(key);
+  if (hit !== undefined) return hit;
+  _cm.set(key, -1);                                  // tentative, guards against any re-entrant cycle (there is none: B->A only)
+  // Conflict-free placement (no two corners ever draw the SAME wall edge -> no z-fighting):
+  //  - non-BENDS: only even/even cells (their orthogonal neighbours are never eligible).
+  //  - BENDS: the WHOLE checkerboard, in TWO passes so adjacent corners can coexist and cluster into T / +
+  //    junctions. Colour A (gx+gz even) places freely; colour B (odd) may only use an edge its adjacent
+  //    colour-A neighbour did NOT consume. Every edge's two cells are opposite colours, so A wins ties ->
+  //    at most one corner per edge.
+  let r = -1;
+  const Z = zoneAt(gx, gz), p = cornerProb(Z);
+  if (p > 0 && hash01(gx, gz, fsalt(SALT_CORNER, F)) < p) {
+    let fE = true, fW = true, fN = true, fS = true, ok = true;     // is each of this cell's four edges free to consume?
+    if (Z === Z_BENDS) {
+      if ((gx + gz) & 1) {                                         // colour B: defer to adjacent colour-A corners
+        const cE = cornerAt(gx + 1, gz, F); fE = cE !== 1 && cE !== 2;   // E edge taken if E-neighbour uses its west (SW/NW)
+        const cW = cornerAt(gx - 1, gz, F); fW = cW !== 0 && cW !== 3;   // W edge taken if W-neighbour uses its east (SE/NE)
+        const cN = cornerAt(gx, gz + 1, F); fN = cN !== 0 && cN !== 1;   // N edge taken if N-neighbour uses its south (SE/SW)
+        const cS = cornerAt(gx, gz - 1, F); fS = cS !== 2 && cS !== 3;   // S edge taken if S-neighbour uses its north (NW/NE)
+      }
+    } else if ((gx & 1) || (gz & 1)) ok = false;                  // non-BENDS: even/even only
+    if (ok) {
+      const wE = wallEastRoom(gx, gz, F) && fE, wW = wallEastRoom(gx - 1, gz, F) && fW;   // walls this cell may turn into a corner
+      const wN = wallNorthRoom(gx, gz, F) && fN, wS = wallNorthRoom(gx, gz - 1, F) && fS;
+      const valid = [];                                            // inside corners whose BOTH edges are free real walls
+      if (wS && wE) valid.push(0);                                 // SE -> south + east
+      if (wS && wW) valid.push(1);                                 // SW -> south + west
+      if (wN && wW) valid.push(2);                                 // NW -> north + west
+      if (wN && wE) valid.push(3);                                 // NE -> north + east
+      if (valid.length) r = valid[hashInt(gx, gz, fsalt(SALT_CORNER, F) ^ 0x5bd1e995) % valid.length];
+    }
+  }
+  _cm.set(key, r);
+  return r;
+}
+// Is a wall segment consumed (drawn) by an adjacent rounded corner, so the straight wall must be skipped?
+// wallEastRoom(gx,gz) is this cell's east edge (corner r 0/3) AND the east neighbour's west edge (its r 1/2).
+function eastWallConsumed(gx, gz, F) {
+  const c = cornerAt(gx, gz, F); if (c === 0 || c === 3) return true;
+  const e = cornerAt(gx + 1, gz, F); return e === 1 || e === 2;
+}
+function northWallConsumed(gx, gz, F) {
+  const c = cornerAt(gx, gz, F); if (c === 2 || c === 3) return true;
+  const n = cornerAt(gx, gz + 1, F); return n === 0 || n === 1;
+}
+function buildChunkFloor(cx, cz, F) {
+  const group = new THREE.Group();
+  const bX = cx * CHUNK, bZ = cz * CHUNK, y0 = F * STORY_H;
+  const floors = [], ceils = [], walls = [], wallsAtrium = [], cols = [], colsPlain = [], colsPillars = [], colsAtrium = [], lampsOn = [], lampsOff = [], stairsS = [], stairsW = [], corners = [];
+  const wallBases = [], pillarBases = [], pillarBases3 = [];   // model baseboards: pillarBases = pillar_1 (door_frame), pillarBases3 = pillar_3 (painted)
+  const doCorners = !!cornerInnerGeo;                      // corner GLB loaded (implies USE_GLB_WALLS) -> swap eligible L-corners + suppress their straight walls
+
+  for (let lz = 0; lz < CHUNK; lz++) for (let lx = 0; lx < CHUNK; lx++) {
+    const gx = bX + lx, gz = bZ + lz, st = roomStoriesAt(gx, gz, F);
+    if (st === 0) continue;                                   // void cell: rendered by the room below
+    const cxw = (gx + 0.5) * CELL, czw = (gz + 0.5) * CELL, ceilY = y0 + ceilStoriesH(st) - SLAB - SLAB_EPS; // drop the ceiling under the slab above
+    const bk = bakedAt(gx, gz, F);                            // baked brightness for this cell (floor + ceiling share it)
+    if (floorSolidAt(gx, gz, F)) floors.push({ x: cxw, z: czw, y: y0, bk });
+    if (!stairCutCell(gx, gz, F)) {                            // leave the stair's emergence cells open to the floor above
+      ceils.push({ x: cxw, z: czw, y: ceilY, lampK: lampBrokenAt(gx, gz, F) ? 0.4 : 1.0, bk }); // dim under dead lights
+      if ((gx & 1) === 0 && (gz & 1) === 0) {                  // one fixture every other cell, hung just under the ceiling
+        const seed = hash01(gx, gz, fsalt(SALT_LIGHT, F));
+        if (seed < LIGHT_BROKEN) lampsOff.push({ x: cxw, z: czw, y: ceilY - 0.01 });            // permanently dead -> OFF model
+        else lampsOn.push({ x: cxw, z: czw, y: ceilY - 0.01, seed });                          // steady or flickering -> ON model (shader handles flicker)
+      }
+    }
+  }
+  // edges -> walls. A wall spans the OWNING cell's OWN room height and is built only when that cell is a
+  // room base (sA != 0). So a tall room makes ONE tall wall at its base; its void floors are skipped
+  // (already enclosed by that base wall) and shorter neighbours are enclosed by the owning cell's
+  // stacked walls. This avoids the coplanar full-height + per-floor walls that used to overlap & z-fight.
+  // A bulkhead fascia fills the ceiling-height step at an open edge, but ONLY when the owning cell is the
+  // TALLER side (sA > neighbour). When it is the shorter side, the owning cell's own stacked walls already
+  // cover that plane, so a fascia there would be coplanar with them and z-fight (it spanned the full height
+  // difference). Capping it to the taller side keeps the bulkhead without the overlap.
+  for (let lz = 0; lz < CHUNK; lz++) for (let lx = 0; lx < CHUNK; lx++) {
+    const gx = bX + lx, gz = bZ + lz, sA = roomStoriesAt(gx, gz, F);
+    if (sA === 0) continue;                                          // void cell: its edges belong to the room based below
+    const yt = y0 + ceilStoriesH(sA);
+    const bk = bakedAt(gx, gz, F);                                   // owning cell's baked brightness, shared by its walls/fascias
+    const sE = roomStoriesAt(gx + 1, gz, F), sN = roomStoriesAt(gx, gz + 1, F);
+    // ATRIUM-owned walls render with the plain panel (wall_1_plain.glb) and carry no wooden baseboard.
+    const wArr = zoneAt(gx, gz) === Z_ATRIUM ? wallsAtrium : walls;
+    if (doCorners) {                                                 // swap this cell's inside-corner L for the rounded model (suppression of its two straight walls handled below + at the south/west owner)
+      const cr = cornerAt(gx, gz, F);
+      if (cr >= 0) corners.push({ x: (gx + 0.5) * CELL, z: (gz + 0.5) * CELL, rot: cr, h: (yt - SLAB) - y0, bk });
+    }
+    if (wallEastRoom(gx, gz, F)) {
+      if (!(doCorners && eastWallConsumed(gx, gz, F))) {            // unless a rounded corner already draws this edge
+        wArr.push({ x: (gx + 1) * CELL, z: (gz + 0.5) * CELL, horizontal: false, yb: y0, yt, bk });
+        if (wArr === walls) wallBases.push({ x: (gx + 1) * CELL, z: (gz + 0.5) * CELL, horizontal: false, bk }); // model skirting at the wall foot (carpet line only, not the fascia branch)
+      }
+    } else if (sE && sA > sE)                                        // owning cell taller -> fascia covers the step above the neighbour's ceiling
+      wArr.push({ x: (gx + 1) * CELL, z: (gz + 0.5) * CELL, horizontal: false, yb: y0 + ceilStoriesH(sE), yt, bk });
+    if (wallNorthRoom(gx, gz, F)) {
+      if (!(doCorners && northWallConsumed(gx, gz, F))) {
+        wArr.push({ x: (gx + 0.5) * CELL, z: (gz + 1) * CELL, horizontal: true, yb: y0, yt, bk });
+        if (wArr === walls) wallBases.push({ x: (gx + 0.5) * CELL, z: (gz + 1) * CELL, horizontal: true, bk });
+      }
+    } else if (sN && sA > sN)
+      wArr.push({ x: (gx + 0.5) * CELL, z: (gz + 1) * CELL, horizontal: true, yb: y0 + ceilStoriesH(sN), yt, bk });
+  }
+  // columns: ONE single-storey segment per grid corner per floor, stacked floor-by-floor so consecutive
+  // segments meet back-to-back with NO vertical overlap -> no z-fighting at pillar bases. (The old code gave
+  // a pillar the height of its tallest neighbour, which overspanned the floors above and overlapped their
+  // pillars; vertical padding overlapped the segment above/below too — both especially bad in PILLARS halls.)
+  // Strictly < CHUNK so each corner is built by exactly one chunk (no coincident pillars).
+  for (let lz = 0; lz < CHUNK; lz++) for (let lx = 0; lx < CHUNK; lx++) {
+    const gx = bX + lx, gz = bZ + lz;
+    if (!columnAt(gx, gz, F) && !wallEndAt(gx, gz, F)) continue;   // grid column, OR cap a free-standing wall end (hides the model's exposed face-plane gap)
+    // A segment RESTS on a real floor (so its base + baseboard show) only if it touches solid floor at this
+    // level AND doesn't continue down through open space below (a void cell under any of its 4 corner cells).
+    // That same test picks the model: a true resting base -> flared pillar_1 (+ baseboard); a visibly-stacked
+    // / continuous shaft (open below, or mid-shaft) -> plain pillar_1_plain_1 (no flare). On the edge of a
+    // tall atrium (floored one side, open drop the other) it reads as one continuous shaft -> plain.
+    let onFloor = false, openBelow = false;
+    for (let a = -1; a <= 0; a++) for (let b = -1; b <= 0; b++) {
+      if (floorSolidAt(gx + a, gz + b, F)) onFloor = true;
+      if (!floorSolidAt(gx + a, gz + b, F - 1)) openBelow = true;
+    }
+    const flared = onFloor && !openBelow, bk = bakedAt(gx, gz, F);
+    const seg = { x: gx * CELL, z: gz * CELL, grimeY: flared ? y0 : -1e6, bk }, Z = zoneAt(gx, gz);
+    if (Z === Z_ATRIUM) {                                            // ATRIUM: thick brick plain_2 for EVERY segment, floor to ceiling (no flare/base)
+      colsAtrium.push(seg);
+    } else if (Z === Z_PILLARS) {                                    // PILLARS halls: pillar_3 (own shaft + painted base)
+      colsPillars.push(seg);
+      if (flared) pillarBases3.push({ x: gx * CELL, z: gz * CELL, bk });
+    } else {                                                         // NORMAL / WRONG: flared pillar_1 base vs plain pillar_1_plain_1 shaft
+      (flared ? cols : colsPlain).push(seg);
+      if (flared) pillarBases.push({ x: gx * CELL, z: gz * CELL, bk });
+    }
+  }
+  // staircases: GLB models on a 1x2-cell footprint (canonical cells (0,0),(1,0) of the block). A
+  // 1-storey room gets the straight concrete flight; a taller room gets one switchback stairwell unit
+  // PER STOREY, stacked into a real well. Each flight/unit is emitted into the chunk-floor band holding
+  // its own storey, so a tall stack streams with the vertical window rather than living entirely in the
+  // base floor's chunk-floor. Placement mirrors stairSurface's canonical frame EXACTLY: the model is
+  // scaled into 1x2 cells x 1 storey, yawed -PI/2 (model -z -> canonical +x: entry at the west edge),
+  // then rotated about the footprint centre by the room's r*90deg — `place` is the same rot2 mapping
+  // the pure layer uses, and -r*PI/2 is the three.js Y-rotation that reproduces it.
+  for (let bx = fdiv(bX, TALL_BLOCK); bx <= fdiv(bX + CHUNK - 1, TALL_BLOCK); bx++)
+    for (let bz = fdiv(bZ, TALL_BLOCK); bz <= fdiv(bZ + CHUNK - 1, TALL_BLOCK); bz++) {
+      const X0 = bx * TALL_BLOCK, Z0 = bz * TALL_BLOCK;
+      if (X0 < bX || X0 >= bX + CHUNK || Z0 < bZ || Z0 >= bZ + CHUNK) continue; // built by the chunk owning the room's base corner
+      const Fb = roomBaseFloor(X0, Z0, F);
+      if (!roomHasStair(bx, bz, Fb)) continue;                                  // (F is within the room's span, so one unit lands in every band of a stack)
+      const H = roomStoriesAt(X0, Z0, Fb), xw = X0 * CELL, zw = Z0 * CELL;
+      const r = stairRot(bx, bz, Fb), Cx = (X0 + 1.5) * CELL, Cz = (Z0 + 1.5) * CELL;
+      const place = (x, z) => { const [qx, qz] = rot2(x - Cx, z - Cz, r); return [Cx + qx, Cz + qz]; };
+      const yaw = -r * Math.PI / 2 - Math.PI / 2, bk = bakedAt(X0, Z0, F);
+      if (H === 1) {                                       // straight flight: origin so the model's back edge (native z=+2.077) lands on the canonical west edge
+        const [px, pz] = place(xw + 2.077 * S5_SCALE, zw + CELL / 2);
+        stairsS.push({ x: px, z: pz, y: y0, yaw, bk });
+      } else {                                             // one switchback unit for THIS band of the stack (model origin = footprint centre)
+        const [px, pz] = place(xw + CELL, zw + CELL / 2);
+        stairsW.push({ x: px, z: pz, y: y0, yaw, bk });
+      }
+    }
+
+  if (floors.length) group.add(instanced(slabGeo, slabMats, floors, (d, it) => { d.position.set(it.x, it.y - SLAB / 2, it.z); d.rotation.set(0, 0, 0); d.scale.set(1, 1, 1); }, it => [1, it.bk, 1])); // slab top sits at it.y; .g = baked light
+  if (ceils.length)  group.add(instanced(planeGeo, ceilMat,  ceils,  (d, it) => { d.position.set(it.x, it.y, it.z); d.rotation.set(Math.PI / 2, 0, 0); d.scale.set(1, 1, 1); }, it => [it.lampK, it.bk, 1]));
+  // walls: GLB origin is bottom-centred (foot at yb, scaled to cell width CELL/WALL_GLB_W & segment height
+  // h/WALL_GLB_H, same yaw rule as the box wall). The box path centres the segment and caps the top at the
+  // slab underside (not the floor above) so a wall top isn't coplanar with the carpet above; .g = baked light.
+  // ATRIUM-owned walls render in their own batch with the plain panel; if that model is unavailable (or GLB
+  // walls are off) they fall back into the default batch.
+  const glbWall = (d, it) => { const top = it.yt - SLAB, h = top - it.yb; d.position.set(it.x, it.yb, it.z); d.rotation.set(0, it.horizontal ? 0 : Math.PI / 2, 0); d.scale.set(CELL / WALL_GLB_W, h / WALL_GLB_H, 1); };
+  const boxWall = (d, it) => { const top = it.yt - SLAB, h = top - it.yb; d.position.set(it.x, (it.yb + top) / 2, it.z); d.rotation.set(0, it.horizontal ? 0 : Math.PI / 2, 0); d.scale.set(1, h / CEIL_NORMAL, 1); };
+  const atriumSplit = USE_GLB_WALLS && atriumWallGeo;
+  const baseWalls = atriumSplit ? walls : walls.concat(wallsAtrium);
+  if (baseWalls.length) {
+    if (USE_GLB_WALLS && wallGlbGeo) group.add(instanced(wallGlbGeo, wallGlbMat, baseWalls, glbWall, it => [y0, it.bk, 1]));
+    else group.add(instanced(wallGeo, wallMat, baseWalls, boxWall, it => [y0, it.bk, 1]));
+  }
+  if (atriumSplit && wallsAtrium.length)
+    group.add(instanced(atriumWallGeo, atriumWallMat, wallsAtrium, glbWall, it => [0, it.bk, 1]));
+  if (corners.length && cornerInnerGeo) {   // rounded inside-corner: model at cell centre, true X/Z scale, walls scaled to height (h/CORNER_H), yawed rot*90deg. Inner+outer faces (full height) + baseboard (native height at foot).
+    const cwall = (d, it) => { d.position.set(it.x, y0, it.z); d.rotation.set(0, it.rot * Math.PI / 2, 0); d.scale.set(1, it.h / CORNER_H, 1); };
+    group.add(instanced(cornerInnerGeo, wallGlbMat,    corners, cwall, it => [0, it.bk, 1]));   // wall_3 face(s) — all of them on models that don't split out a separate outer material
+    if (cornerOuterGeo) group.add(instanced(cornerOuterGeo, cornerOuterMat, corners, cwall, it => [0, it.bk, 1]));  // separate convex face (wall_mp_1), only on some models
+    group.add(instanced(cornerBaseGeo, baseGlbMat, corners, (d, it) => { d.position.set(it.x, y0 - 0.02, it.z); d.rotation.set(0, it.rot * Math.PI / 2, 0); d.scale.set(1, 1, 1); }, it => [0, it.bk, 1]));
+  }
+  if (cols.length || colsPlain.length || colsPillars.length || colsAtrium.length) {
+    if (USE_GLB_WALLS && pillarGlbGeo) {   // GLB shaft: foot at y0, scaled to one storey (STORY_H/PILLAR_GLB_H). Stacks per floor like the box column.
+      const pFn = (d, it) => { d.position.set(it.x, y0, it.z); d.rotation.set(0, 0, 0); d.scale.set(1, STORY_H / PILLAR_GLB_H, 1); }, cf = it => [0, it.bk, 1];
+      const flaredList = pillarPlainGeo ? cols : cols.concat(colsPlain);   // plain model missing -> render stacked segments with the flared shaft too (graceful fallback)
+      if (flaredList.length) group.add(instanced(pillarGlbGeo, wallGlbMat, flaredList, pFn, cf));            // NORMAL/WRONG resting bases -> flared pillar_1 (+ baseboard pushed above)
+      if (pillarPlainGeo && colsPlain.length) group.add(instanced(pillarPlainGeo, pillarPlainMat, colsPlain, pFn, cf)); // NORMAL/WRONG stacked/continuous -> plain shaft, no flare
+      if (colsPillars.length) group.add(instanced(pillar3Geo || pillarGlbGeo, pillar3Geo ? pillar3Mat : wallGlbMat, colsPillars, pFn, cf));      // PILLARS halls -> pillar_3 (fallback pillar_1)
+      if (colsAtrium.length) group.add(instanced(atriumPillarGeo || pillarPlainGeo || pillarGlbGeo, atriumPillarGeo ? atriumPillarMat : (pillarPlainGeo ? pillarPlainMat : wallGlbMat), colsAtrium, pFn, cf)); // ATRIUM -> thick brick plain_2 (fallback plain_1 / pillar_1)
+    } else
+      group.add(instanced(colGeo, wallMat, cols.concat(colsPlain, colsPillars, colsAtrium), (d, it) => { d.position.set(it.x, y0 + STORY_H / 2, it.z); d.rotation.set(0, 0, 0); d.scale.set(1, 1, 1); }, it => [it.grimeY, it.bk, 1])); // box fallback: one storey per segment, grime only on resting bases
+  }
+  if (lampsOn.length && lampOnGeo)  group.add(instanced(lampOnGeo,  lampOnMat,  lampsOn,  (d, it) => { d.position.set(it.x, it.y, it.z); d.rotation.set(0, 0, 0); d.scale.setScalar(LAMP_SCALE); }, it => [it.seed, 1, 1])); // seed -> flicker state in the shader
+  if (lampsOff.length && lampOffGeo) group.add(instanced(lampOffGeo, lampOffMat, lampsOff, (d, it) => { d.position.set(it.x, it.y, it.z); d.rotation.set(0, 0, 0); d.scale.setScalar(LAMP_SCALE); }));
+  // stair models: scale is in MODEL axes (applied before the yaw): width -> 1 cell, height -> 1 storey,
+  // length -> the 2-cell run. Geo missing (load failed) -> stairs simply don't render (still walkable).
+  if (stairsS.length && stairsSGeo) group.add(instanced(stairsSGeo, stairsSMat, stairsS, (d, it) => { d.position.set(it.x, it.y, it.z); d.rotation.set(0, it.yaw, 0); d.scale.set(CELL / 2, STORY_H / 3, S5_SCALE); }, it => [0, it.bk, 1]));
+  if (stairsW.length && stairsWGeo) group.add(instanced(stairsWGeo, stairsWMat, stairsW, (d, it) => { d.position.set(it.x, it.y, it.z); d.rotation.set(0, it.yaw, 0); d.scale.set(CELL / 4, STORY_H / 3, CELL / 3); }, it => [0, it.bk, 1]));
+  if (USE_GLB_WALLS && wallBaseGeo && wallBases.length)      // model skirting (native ~0.16 m height) sunk 2 cm so its underside clears the carpet; scaled to cell width, yawed like its wall
+    group.add(instanced(wallBaseGeo, baseGlbMat, wallBases, (d, it) => { d.position.set(it.x, y0 - 0.02, it.z); d.rotation.set(0, it.horizontal ? 0 : Math.PI / 2, 0); d.scale.set(CELL / WALL_BASE_W, 1, 1); }, it => [0, it.bk, 1]));
+  if (USE_GLB_WALLS && pillarBaseGeo && pillarBases.length)  // pillar_1 baseboard ring at each foot resting on a floor
+    group.add(instanced(pillarBaseGeo, baseGlbMat, pillarBases, (d, it) => { d.position.set(it.x, y0 - 0.02, it.z); d.rotation.set(0, 0, 0); d.scale.set(1, 1, 1); }, it => [0, it.bk, 1]));
+  if (USE_GLB_WALLS && pillar3BaseGeo && pillarBases3.length)  // pillar_3 (painted) base ring under PILLARS-hall columns
+    group.add(instanced(pillar3BaseGeo, pillar3BaseMat, pillarBases3, (d, it) => { d.position.set(it.x, y0 - 0.02, it.z); d.rotation.set(0, 0, 0); d.scale.set(1, 1, 1); }, it => [0, it.bk, 1]));
+  return group;
+}
+
+/* ============================================================================
+ * STREAMING  (chunk x floor window)
+ * ========================================================================== */
+const loaded = new Map();
+const buildQueue = [];          // pending chunk-floors {cx, cz, F, k} not yet built (built under a per-frame budget by processBuildQueue)
+const queued = new Set();       // keys currently in buildQueue (dedupe so a re-entered window doesn't double-enqueue)
+let lastKey = null;
+let buildErrLogged = false;
+function buildOne(k, cx, cz, F) {
+  let g;
+  try { g = buildChunkFloor(cx, cz, F); }
+  catch (e) { if (!buildErrLogged) { buildErrLogged = true; console.error('buildChunkFloor failed at', k, '(skipping this chunk):', e); } g = new THREE.Group(); }
+  scene.add(g); loaded.set(k, g);   // store even an empty group so the chunk isn't re-queued forever
+}
+function updateStreaming(immediate) {
+  const pf = Math.round((camera.position.y - EYE) / STORY_H);
+  const pcx = fdiv(camera.position.x, CHUNK * CELL), pcz = fdiv(camera.position.z, CHUNK * CELL);
+  const trig = pcx + '|' + pcz + '|' + pf;
+  if (trig === lastKey && !immediate) return;   // no boundary crossed: nothing to (de)queue; processBuildQueue still drains any backlog every frame
+  lastKey = trig;
+  const need = new Set();
+  for (let dz = -RENDER_RADIUS; dz <= RENDER_RADIUS; dz++) for (let dx = -RENDER_RADIUS; dx <= RENDER_RADIUS; dx++)
+    for (let F = pf - FLOORS_BELOW; F <= pf + FLOORS_ABOVE; F++) {
+      const k = (pcx + dx) + '_' + (pcz + dz) + '_' + F; need.add(k);
+      if (!loaded.has(k) && !queued.has(k)) { buildQueue.push({ cx: pcx + dx, cz: pcz + dz, F, k }); queued.add(k); }
+    }
+  for (const [k, g] of loaded) if (!need.has(k)) { scene.remove(g); g.traverse(o => { if (o.isInstancedMesh) o.dispose(); }); loaded.delete(k); }
+  for (let i = buildQueue.length - 1; i >= 0; i--) if (!need.has(buildQueue[i].k)) { queued.delete(buildQueue[i].k); buildQueue.splice(i, 1); } // drop queued builds the player moved away from before they were reached
+  if (immediate) while (buildQueue.length) { const b = buildQueue.pop(); queued.delete(b.k); buildOne(b.k, b.cx, b.cz, b.F); } // spawn / fly-mode on-demand: build the whole window now
+}
+// Build queued chunk-floors nearest-first, only as many as fit in BUILD_BUDGET_MS — spreading a boundary crossing's burst across frames. Always builds at least one so the queue can't starve.
+function processBuildQueue() {
+  if (!buildQueue.length) return;
+  const pf = Math.round((camera.position.y - EYE) / STORY_H);
+  const pcx = fdiv(camera.position.x, CHUNK * CELL), pcz = fdiv(camera.position.z, CHUNK * CELL);
+  const d2 = b => { const ax = b.cx - pcx, az = b.cz - pcz, af = b.F - pf; return ax * ax + az * az + af * af; };
+  buildQueue.sort((a, b) => d2(b) - d2(a));   // farthest first so the cheap pop() from the tail yields the nearest
+  const t0 = performance.now();
+  do { const b = buildQueue.pop(); queued.delete(b.k); buildOne(b.k, b.cx, b.cz, b.F); }
+  while (buildQueue.length && performance.now() - t0 < BUILD_BUDGET_MS);
+}
+
+/* ============================================================================
+ * CONTROLS + INPUT
+ * ========================================================================== */
+const controls = new PointerLockControls(camera, document.body);
+const overlay = document.getElementById('overlay'), hud = document.getElementById('hud');
+overlay.addEventListener('click', () => controls.lock());
+controls.addEventListener('lock', () => { overlay.style.display = 'none'; startAudio(); });
+controls.addEventListener('unlock', () => { overlay.style.display = 'flex'; });
+const keys = new Set();
+// --- debug free-fly camera (no pointer lock needed): G toggles; WASD/QE move, arrows look ---
+let flyMode = false;
+function flyStep(code) {
+  const STEP = 1.5, LS = 0.18, d = new THREE.Vector3(), rt = new THREE.Vector3();
+  camera.getWorldDirection(d);
+  rt.set(1, 0, 0).applyQuaternion(camera.quaternion); rt.y = 0; rt.normalize();
+  if (code === 'KeyW') camera.position.addScaledVector(d, STEP);
+  else if (code === 'KeyS') camera.position.addScaledVector(d, -STEP);
+  else if (code === 'KeyD') camera.position.addScaledVector(rt, STEP);
+  else if (code === 'KeyA') camera.position.addScaledVector(rt, -STEP);
+  else if (code === 'KeyE' || code === 'Space') camera.position.y += STEP;
+  else if (code === 'KeyQ') camera.position.y -= STEP;
+  else if (code === 'ArrowLeft') camera.rotation.y += LS;
+  else if (code === 'ArrowRight') camera.rotation.y -= LS;
+  else if (code === 'ArrowUp') camera.rotation.x = Math.min(1.5, camera.rotation.x + LS);
+  else if (code === 'ArrowDown') camera.rotation.x = Math.max(-1.5, camera.rotation.x - LS);
+}
+window.addEventListener('keydown', e => {
+  if (e.code === 'KeyR' && (e.ctrlKey || e.metaKey)) { // reset with a fresh random seed (whole world is a pure fn of SEED)
+    e.preventDefault();
+    location.hash = 'seed=' + ((Math.random() * 0x100000000) >>> 0);
+    location.reload();
+    return;
+  }
+  if (e.code === 'KeyH') hud.style.display = hud.style.display === 'none' ? '' : 'none';
+  if (e.code === 'KeyG') {
+    flyMode = !flyMode;
+    overlay.style.display = flyMode ? 'none' : 'flex';
+    camera.rotation.order = 'YXZ';
+    renderer.setAnimationLoop(flyMode ? null : frame); // stop the loop in fly mode so the page can idle for screenshots
+  }
+  if (flyMode) { flyStep(e.code); updateStreaming(true); renderer.render(scene, camera); } // render on demand (build synchronously: the animation loop is stopped, so processBuildQueue won't run)
+  keys.add(e.code);
+});
+window.addEventListener('keyup', e => keys.delete(e.code));
+// hold right mouse button to crouch. Track it directly (PointerLockControls only uses mouse movement, so the buttons are free).
+let rmbDown = false;
+window.addEventListener('mousedown', e => { if (e.button === 2) rmbDown = true; });
+window.addEventListener('mouseup', e => { if (e.button === 2) rmbDown = false; });
+window.addEventListener('blur', () => { rmbDown = false; });           // release crouch if focus is lost mid-hold (else a missed mouseup sticks it down)
+window.addEventListener('contextmenu', e => e.preventDefault());       // suppress the right-click menu so RMB-crouch never pops it (pointer-lock already hides it; this covers the unlocked case)
+
+/* ============================================================================
+ * AUDIO + FLICKER
+ * ========================================================================== */
+let audioStarted = false;
+function startAudio() {
+  if (audioStarted) return; audioStarted = true;
+  const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+  const ctx = new AC(); if (ctx.state === 'suspended') ctx.resume();
+  const master = ctx.createGain(); master.gain.value = 0.045; master.connect(ctx.destination);
+  const mk = (f, g0) => { const o = ctx.createOscillator(); o.type = 'sine'; o.frequency.value = f; const g = ctx.createGain(); g.gain.value = g0; o.connect(g).connect(master); o.start(); };
+  mk(120, 0.6); mk(60, 0.3); mk(180, 0.12);
+  const buf = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate), d = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * 0.5;
+  const nz = ctx.createBufferSource(); nz.buffer = buf; nz.loop = true;
+  const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1000; bp.Q.value = 0.6;
+  const ng = ctx.createGain(); ng.gain.value = 0.05; nz.connect(bp).connect(ng).connect(master); nz.start();
+}
+const flick = { next: 0, until: 0, base: 0.7 };
+function flickerTick(t) {
+  if (t > flick.next) { flick.until = t + 0.04 + Math.random() * 0.12; flick.next = t + 2 + Math.random() * 6; }
+  const on = t > flick.until;
+  if (lampOnMat) lampOnMat.emissiveIntensity = flick.base * (on ? 0.9 + 0.1 * Math.random() : 0.3); // global subtle pulse on the ON fixtures (set once they've loaded)
+  hemi.intensity = on ? 0.32 : 0.22;
+}
+
+/* ============================================================================
+ * PLAYER (gravity + ground snap) + MAIN LOOP
+ * ========================================================================== */
+const fwd = new THREE.Vector3(), rgt = new THREE.Vector3();
+let vy = 0, grounded = false, eye = EYE;   // `eye` is the live eye-above-feet offset, eased toward EYE / CROUCH_EYE (held-RMB crouch, not sticky)
+function updateMovement(dt) {
+  camera.getWorldDirection(fwd); fwd.y = 0; fwd.normalize();
+  rgt.set(1, 0, 0).applyQuaternion(camera.quaternion); rgt.y = 0; rgt.normalize();
+  let fy = camera.position.y - eye;   // recover feet with the eye offset that produced the current camera height (keeps ground-snap exact through a crouch)
+  const crouching = rmbDown;   // hold right mouse button to crouch (drives eye height, crawl speed, and FOV below). RMB avoids the browser stealing Ctrl+W.
+
+  const f = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
+  const r = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
+  if (f || r) {
+    let vx = fwd.x * f + rgt.x * r, vz = fwd.z * f + rgt.z * r;
+    const gait = crouching ? CROUCH_SPEED : (keys.has('ShiftLeft') || keys.has('ShiftRight') ? SPRINT : 1); // crouch crawl overrides sprint — you can't run while sneaking
+    const len = Math.hypot(vx, vz) || 1, spd = WALK * gait * dt;
+    [camera.position.x, camera.position.z] = moveWithCollision(camera.position.x, camera.position.z, vx / len * spd, vz / len * spd, fy, eye);  // eye = live head clearance: crouch (RMB) to duck under low stair soffits
+  }
+
+  // vertical
+  if (grounded && keys.has('Space')) { vy = JUMP; grounded = false; }
+  vy -= GRAVITY * dt; if (vy < -TERMINAL) vy = -TERMINAL;
+  let nfy = fy + vy * dt;
+  const g = groundAt(camera.position.x, camera.position.z, fy + STEP_UP);
+  if (g > -Infinity && nfy <= g) { nfy = g; vy = 0; grounded = true; }               // land / step up
+  else if (g > -Infinity && grounded && vy <= 0 && g >= fy - SNAP_DOWN) { nfy = g; vy = 0; } // stick going down stairs
+  else grounded = false;
+  const ease = Math.min(1, CROUCH_RATE * dt);
+  eye += ((crouching ? CROUCH_EYE : EYE) - eye) * ease;   // hold RMB to crouch; releasing eases back up (not sticky)
+  camera.position.y = nfy + eye;
+  // Ease the FOV with the crouch too. NOTE (VR): do NOT carry this FOV manipulation into a VR build — in a
+  // headset the projection is fixed by the HMD/runtime and tampering with FOV induces discomfort/sim-sickness.
+  // Keep crouch-FOV a flatscreen-only effect (gate it on !renderer.xr.isPresenting if/when XR is added).
+  const fovTarget = crouching ? CROUCH_FOV : FOV;
+  if (Math.abs(camera.fov - fovTarget) > 0.01) { camera.fov += (fovTarget - camera.fov) * ease; camera.updateProjectionMatrix(); }
+}
+
+let prevT = performance.now(), hudAcc = 0, hudFrames = 0, fps = 0;
+function updateHUD(dt) {
+  hudFrames++; hudAcc += dt;
+  if (hudAcc >= 0.5) {
+    fps = Math.round(hudFrames / hudAcc); hudFrames = 0; hudAcc = 0;
+    const gx = fdiv(camera.position.x, CELL), gz = fdiv(camera.position.z, CELL), F = Math.round((camera.position.y - EYE) / STORY_H);
+    hud.textContent = `FPS ${fps}  |  floor ${F}  |  ${ZONE_NAMES[zoneAt(gx, gz)]}  |  cell ${gx},${gz}  |  seed ${SEED}`;
+  }
+}
+window.addEventListener('resize', () => { camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); });
+
+{ const gy = groundAt(camera.position.x, camera.position.z, 0.5); camera.position.y = (isFinite(gy) ? gy : 0) + EYE; }
+
+/* ---- runtime 3D-asset test: drop a chair on the floor ~1.2 m from spawn ---------------------------
+ * Loaded once at startup (async), placed deterministically off the spawn point. NOT part of the pure
+ * generation layer — it's a fixed prop, not streamed/recomputed. Tune CHAIR_SCALE if it imports wrong-sized. */
+const CHAIR_SCALE = 1.0;   // GLB is metres if authored so; if the chair comes in giant/tiny, some exporters use cm -> try 0.01
+new GLTFLoader().load('backrooms_assets/chair_mp_1.glb', gltf => {
+  const chair = gltf.scene;
+  chair.scale.setScalar(CHAIR_SCALE);
+  chair.updateMatrixWorld(true);
+  const tx = SPAWN.x + 1.2, tz = SPAWN.z, gy = groundAt(tx, tz, 0.5), floorY = isFinite(gy) ? gy : 0;
+  const box = new THREE.Box3().setFromObject(chair);                 // recentre on x/z and rest the model's base on the floor, whatever its own origin is
+  chair.position.x += tx - (box.min.x + box.max.x) / 2;
+  chair.position.z += tz - (box.min.z + box.max.z) / 2;
+  chair.position.y += floorY - box.min.y;
+  chair.traverse(o => {                                  // the GLB ships matte (metalness:0, roughness:1) with a dark wood texture -> a flat black silhouette. Give it specular + reflection so the IBL probe reveals its form, and lift the very dark albedo.
+    if (!o.isMesh) return;
+    const m = o.material;
+    m.roughness = Math.min(m.roughness ?? 1, 0.55);      // varnished-wood gloss so it catches a soft reflection (form), instead of rough:1 = pure diffuse
+    m.metalness = 0.08;
+    m.envMapIntensity = 1.5;                             // drink in a bit more of the room probe than the walls do
+    if (m.color) m.color.multiplyScalar(1.7);            // brighten the near-black wood-stain texture off the floor of the histogram
+    m.needsUpdate = true;
+  });
+  scene.add(chair);
+}, undefined, err => console.error('chair_mp_1.glb failed to load:', err));
+
+// Pull a single mesh's geometry + material out of a loaded GLB, baking the node transform so the bare
+// geometry is world-aligned and ready to instance.
+function lampFromGltf(gltf) {
+  gltf.scene.updateMatrixWorld(true);
+  let mesh = null;
+  gltf.scene.traverse(o => { if (o.isMesh && !mesh) mesh = o; });
+  const geo = mesh.geometry.clone();
+  geo.applyMatrix4(mesh.matrixWorld);
+  return { geo, mat: mesh.material };
+}
+const loadGLB = file => new Promise((res, rej) => new GLTFLoader().load('backrooms_assets/' + file, res, undefined, rej));
+
+// Pull every primitive using the named material out of a loaded GLB, bake world matrices, and merge
+// them into one instanceable geometry. (wall_1/pillar_1 each split into a `wall_3` shaft/face piece and
+// a `door_frame_wood_1` baseboard piece.) Returns the merged geometry + that material instance.
+function geoByMaterial(gltf, matName) {
+  gltf.scene.updateMatrixWorld(true);
+  const geos = []; let mat = null;
+  gltf.scene.traverse(o => {
+    if (!o.isMesh || !o.material || o.material.name !== matName) return;
+    const g = o.geometry.clone(); g.applyMatrix4(o.matrixWorld); geos.push(g);
+    if (!mat) mat = o.material;
+  });
+  if (!geos.length) return { geo: null, mat: null };
+  return { geo: geos.length > 1 ? mergeGeometries(geos, false) : geos[0], mat };
+}
+// Give a swapped-in structural material the same baked lamp-pool light as the procedural surfaces
+// (instanceColor.g) plus a touch of IBL reflection, so it lights identically to everything else.
+function installPoolLight(mat) {
+  mat.envMapIntensity = 1.0;
+  mat.onBeforeCompile = (shader) => {
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <color_fragment>', '')                 // instanceColor carries baked light, not a tint
+      .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+        ${poolAdd(POOL_GAIN)}`);
+  };
+  mat.needsUpdate = true;
+}
+
+let frameErrLogged = false;
+function frame() {
+  const now = performance.now(); let dt = (now - prevT) / 1000; prevT = now; if (dt > 0.05) dt = 0.05;
+  try {
+    if (controls.isLocked) updateMovement(dt);
+    updateStreaming(); processBuildQueue(); flickerTick(now / 1000); lightUniforms.uTime.value = now / 1000; updateHUD(dt);
+    renderer.render(scene, camera);
+  } catch (e) {   // never let one bad frame kill the render loop (a thrown error stops requestAnimationFrame -> looks like a hard freeze)
+    if (!frameErrLogged) { frameErrLogged = true; console.error('frame() error (loop continues):', e); }
+  }
+}
+// Preload both ceiling-lamp models, THEN build the spawn window and start the loop — they're part of the
+// streamed geometry, so they must exist before the first chunk-floor is built. .finally() still starts the
+// game if a model fails (the instancing calls are guarded by lampOnGeo/lampOffGeo, so it just runs without
+// fixtures rather than hanging on a black screen).
+// Load the wall + pillar models alongside the lamps (own .catch isolates failure -> falls back to box geo).
+// The plain-pillar and rounded-corner models are loaded SEPARATELY and are each fully optional: a problem
+// with either disables only that feature (plain shafts fall back to the flared pillar; corners turn off),
+// never the walls/pillars or the whole game.
+const structLoad = USE_GLB_WALLS
+  ? Promise.all([loadGLB('wall_1.glb'), loadGLB('pillar_1.glb')]).then(([wg, pg]) => {
+      const wf = geoByMaterial(wg, 'wall_3'), wb = geoByMaterial(wg, 'door_frame_wood_1');
+      const ps = geoByMaterial(pg, 'wall_3'), pb = geoByMaterial(pg, 'door_frame_wood_1');
+      wallGlbGeo = wf.geo; wallGlbMat = wf.mat; installPoolLight(wallGlbMat);   // wall_3 shared by wall faces + pillar shafts + corner inner face
+      pillarGlbGeo = ps.geo;
+      wallBaseGeo = wb.geo; pillarBaseGeo = pb.geo;
+      baseGlbMat = wb.mat; installPoolLight(baseGlbMat);                        // door_frame_wood shared by all baseboards
+      const plainLoad = loadGLB('pillar_1_plain_1.glb').then(ppg => {
+        const pp = geoByMaterial(ppg, 'wall_mp_1');
+        if (!pp.geo) throw new Error('plain pillar missing a wall_mp_1 mesh');
+        if (pillarPlainMat = pp.mat) installPoolLight(pillarPlainMat);
+        pillarPlainGeo = pp.geo;                                              // set LAST: only switch stacked segments to plain once the geo is valid
+      }).catch(err => { pillarPlainGeo = null; console.error('plain pillar disabled (stacked segments use the flared shaft):', err); });
+      const cornerLoad = loadGLB('wall_1_rounded_corner_1.glb').then(cg => {
+        const ci = geoByMaterial(cg, 'wall_3'), co = geoByMaterial(cg, 'wall_mp_1'), cb = geoByMaterial(cg, 'door_frame_wood_1');
+        if (!ci.geo || !cb.geo) throw new Error('corner model missing a wall_3 / door_frame_wood_1 mesh');
+        cornerOuterGeo = co.geo;                                               // ci covers ALL wall_3 faces; some models put BOTH faces on wall_3 -> no separate outer piece
+        cornerBaseGeo = cb.geo;
+        if (cornerOuterMat = co.mat) installPoolLight(cornerOuterMat);
+        cornerInnerGeo = ci.geo;                                              // set LAST: doCorners only turns on once every required piece is valid
+      }).catch(err => { cornerInnerGeo = null; console.error('rounded-corner model disabled (walls/pillars unaffected):', err); });
+      const pillars3Load = loadGLB('pillar_3.glb').then(p3 => {                  // PILLARS-hall pillar (wall_6 shaft + painted base)
+        const sh = geoByMaterial(p3, 'wall_6'), ba = geoByMaterial(p3, 'wood_painted_white');
+        if (!sh.geo) throw new Error('pillar_3 missing a wall_6 mesh');
+        pillar3BaseGeo = ba.geo; if (pillar3BaseMat = ba.mat) installPoolLight(pillar3BaseMat);
+        if (pillar3Mat = sh.mat) installPoolLight(pillar3Mat);
+        pillar3Geo = sh.geo;
+      }).catch(err => { pillar3Geo = null; console.error('pillar_3 disabled (PILLARS halls use the default pillar):', err); });
+      const atriumLoad = loadGLB('pillar_1_plain_2.glb').then(ap => {            // thick brick ATRIUM pillar
+        const sh = geoByMaterial(ap, 'wall_mp_1');
+        if (!sh.geo) throw new Error('atrium pillar missing a wall_mp_1 mesh');
+        if (atriumPillarMat = sh.mat) installPoolLight(atriumPillarMat);
+        atriumPillarGeo = sh.geo;
+      }).catch(err => { atriumPillarGeo = null; console.error('atrium pillar disabled (ATRIUM uses the plain shaft):', err); });
+      const atriumWallLoad = loadGLB('wall_1_plain.glb').then(aw => {            // plain wall panel for ATRIUM-owned walls
+        const wf = geoByMaterial(aw, 'wall_mp_1');
+        if (!wf.geo) throw new Error('atrium wall missing a wall_mp_1 mesh');
+        if (atriumWallMat = wf.mat) installPoolLight(atriumWallMat);
+        atriumWallGeo = wf.geo;                                                // set LAST: ATRIUM walls only swap once the geo is valid
+      }).catch(err => { atriumWallGeo = null; console.error('atrium wall disabled (ATRIUM uses the default wall panel):', err); });
+      return Promise.all([plainLoad, cornerLoad, pillars3Load, atriumLoad, atriumWallLoad]);
+    }).catch(err => console.error('wall/pillar models failed to load — using procedural structure:', err))
+  : Promise.resolve();
+// Stair models, independent of the wall set. Fully optional: a load problem leaves the stairs walkable
+// (the pure layer doesn't care) but unrendered, and never blocks the game from starting.
+const stairLoad = Promise.all([loadGLB('stairs_mp_1.glb'), loadGLB('stairs_5_concrete.glb')]).then(([swg, s5g]) => {
+  const sw = geoByMaterial(swg, 'concrete_4'), s5 = geoByMaterial(s5g, 'concrete_4');
+  if (!sw.geo || !s5.geo) throw new Error('stair model missing a concrete_4 mesh');
+  if (stairsWMat = sw.mat) installPoolLight(stairsWMat);
+  if (stairsSMat = s5.mat) installPoolLight(stairsSMat);
+  stairsWGeo = sw.geo; stairsSGeo = s5.geo;                 // set LAST: instances only emit once both are valid
+}).catch(err => { stairsWGeo = stairsSGeo = null; console.error('stair models failed to load — stairs are invisible but still walkable:', err); });
+Promise.all([loadGLB('ceiling_lamp_4_on.glb'), loadGLB('ceiling_lamp_4_off.glb'), structLoad, stairLoad])
+  .then(([onGltf, offGltf]) => {
+    const on = lampFromGltf(onGltf), off = lampFromGltf(offGltf);
+    lampOnGeo = on.geo; lampOnMat = on.mat; installLampFlicker(lampOnMat);
+    lampOffGeo = off.geo; lampOffMat = off.mat;
+    for (const m of [lampOnMat, lampOffMat]) {            // metal housings ship matte (roughness:1) -> flat black. Give them a touch of gloss + reflection so the IBL probe reads them as fixtures, not dark blobs. (The ON tube's emissive is untouched.)
+      m.roughness = 0.6; m.envMapIntensity = 1.2;
+      if (m.color) m.color.multiplyScalar(1.25);
+      m.needsUpdate = true;
+    }
+  })
+  .catch(err => console.error('ceiling lamp models failed to load — running without fixtures:', err))
+  .finally(() => {
+    updateStreaming(true);          // build the spawn window (with lamp models if they loaded) so the first frame isn't empty
+    prevT = performance.now();      // reset so the load wait doesn't produce a huge first-frame dt
+    renderer.setAnimationLoop(frame);
+  });
+</script>
+</body>
+</html>

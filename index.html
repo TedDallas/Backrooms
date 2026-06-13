@@ -3,6 +3,10 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="BACKROOMS" />
 <title>THE BACKROOMS</title>
 <!--
   Single-file procedural backrooms — TRUE MULTI-LEVEL.
@@ -49,11 +53,6 @@
   #btnJump   { right: max(20px, env(safe-area-inset-right)); }
   #btnCrouch { right: calc(max(20px, env(safe-area-inset-right)) + 92px); }
   .mbtn.active { background: rgba(255,240,150,0.5); color: #1a1705; border-color: rgba(255,250,210,0.85); }
-  #rotate { position: fixed; inset: 0; display: none; flex-direction: column; align-items: center;
-    justify-content: center; text-align: center; z-index: 20; pointer-events: auto; background: rgba(0,0,0,.93);
-    color: #efe6a8; font-family: "Courier New", monospace; }
-  #rotate .ico { font-size: 46px; margin-bottom: 12px; }
-  #rotate .msg { font-size: 16px; letter-spacing: 2px; }
 </style>
 
 <script type="importmap">
@@ -72,7 +71,7 @@
   <div class="sub">level 0 &middot; you noclipped out of reality</div>
   <div class="keys">
     <b>W A S D</b> &nbsp;move &nbsp;&nbsp; <b>MOUSE</b> &nbsp;look &nbsp;&nbsp; <b>SHIFT</b> &nbsp;run &nbsp;&nbsp; <b>SPACE</b> &nbsp;jump<br/>
-    <b>ESC</b> &nbsp;pause &nbsp;&nbsp; <b>H</b> &nbsp;toggle debug &nbsp;&nbsp; <b>CTRL&#8209;R</b> &nbsp;new level
+    <b>ESC</b> &nbsp;pause &nbsp;&nbsp; <b>F</b> &nbsp;fullscreen &nbsp;&nbsp; <b>H</b> &nbsp;toggle debug &nbsp;&nbsp; <b>CTRL&#8209;R</b> &nbsp;new level
   </div>
   <div class="enter">CLICK TO ENTER</div>
 </div>
@@ -80,7 +79,6 @@
   <div id="btnCrouch" class="mbtn">CROUCH</div>
   <div id="btnJump" class="mbtn">JUMP</div>
 </div>
-<div id="rotate"><div class="ico">&#x21BB;</div><div class="msg">ROTATE TO LANDSCAPE</div></div>
 
 <script type="module">
 import * as THREE from 'three';
@@ -1232,9 +1230,13 @@ const MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
 let mobileActive = false, mobileCrouch = false, mobileJumpReq = false;
 const mobileInput = { f: 0, r: 0, mag: 0 };   // f/r = unit move direction (forward/right), mag = 0..1 deflection
 let mYaw = 0, mPitch = 0;                      // live look angles while in mobile mode
-const rotateEl = document.getElementById('rotate');
-function updateOrientation() {                 // iOS can't lock orientation via API -> prompt to rotate when portrait
-  if (rotateEl) rotateEl.style.display = (mobileActive && window.innerHeight > window.innerWidth) ? 'flex' : 'none';
+// Best-effort fullscreen. Works on Android/desktop browsers; iOS Safari doesn't support the Fullscreen
+// API for pages (only "Add to Home Screen", enabled via the apple-mobile-web-app meta tags), so this
+// just no-ops there. Called on the entry tap (a user gesture, which fullscreen requires).
+function goFullscreen() {
+  const el = document.documentElement;
+  const req = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen;
+  if (req) { try { const p = req.call(el); if (p && p.catch) p.catch(() => {}); } catch (e) {} }
 }
 function startMobile() {
   if (!mobileActive) {
@@ -1245,10 +1247,7 @@ function startMobile() {
   }
   overlay.style.display = 'none';
   startAudio();
-  const el = document.documentElement;                                            // best-effort fullscreen + landscape lock (works on Android/Chrome; iOS Safari falls back to the rotate prompt)
-  if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
-  if (screen.orientation && screen.orientation.lock) screen.orientation.lock('landscape').catch(() => {});
-  updateOrientation();
+  goFullscreen();                              // portrait AND landscape both supported -> no orientation lock
 }
 overlay.addEventListener('click', () => { if (MOBILE) startMobile(); else controls.lock(); });
 controls.addEventListener('lock', () => { overlay.style.display = 'none'; startAudio(); });
@@ -1323,6 +1322,7 @@ window.addEventListener('keydown', e => {
     return;
   }
   if (e.code === 'KeyH') hud.style.display = hud.style.display === 'none' ? '' : 'none';
+  if (e.code === 'KeyF') { if (document.fullscreenElement) document.exitFullscreen(); else goFullscreen(); }   // toggle fullscreen
   if (e.code === 'KeyG') {
     flyMode = !flyMode;
     overlay.style.display = flyMode ? 'none' : 'flex';
@@ -1415,8 +1415,7 @@ function updateHUD(dt) {
     hud.textContent = `FPS ${fps}  |  floor ${F}  |  ${ZONE_NAMES[zoneAt(gx, gz)]}  |  cell ${gx},${gz}  |  seed ${SEED}`;
   }
 }
-window.addEventListener('resize', () => { camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); updateOrientation(); });
-window.addEventListener('orientationchange', updateOrientation);
+window.addEventListener('resize', () => { camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); });
 
 { const gy = groundAt(camera.position.x, camera.position.z, 0.5); camera.position.y = (isFinite(gy) ? gy : 0) + EYE; }
 

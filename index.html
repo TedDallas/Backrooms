@@ -615,6 +615,33 @@ renderer.toneMappingExposure = 1.0;                   // overall exposure dial (
 document.body.appendChild(renderer.domElement);
 const MAX_ANISO = renderer.capabilities.getMaxAnisotropy();
 
+// On-screen diagnostics (append #diag to the URL). Surfaces WebGL caps, shader compile/link errors, and
+// loaded-texture state directly on the page, so mobile browsers can be debugged without a desktop inspector.
+const DIAG = /diag/.test(location.search + location.hash);   // ?diag (query busts Safari's cache) or #diag
+let dlog = () => {};
+if (DIAG) {
+  const d = document.createElement('div');
+  d.style.cssText = 'position:fixed;left:0;top:0;max-width:100%;max-height:60%;overflow:auto;z-index:60;background:rgba(0,0,0,.82);color:#9f9;font:10px/1.35 monospace;padding:5px;white-space:pre-wrap;pointer-events:none';
+  document.body.appendChild(d);
+  dlog = (...a) => { d.textContent += a.map(x => x === undefined ? 'undef' : String(x)).join(' ') + '\n'; };
+  dlog('BUILD diag-2 (' + new Date().toISOString().slice(0, 16) + ')');   // confirms the page is fresh, not cached
+  const oe = console.error, ow = console.warn;
+  console.error = (...a) => { dlog('ERR', a.map(String).join(' ')); oe.apply(console, a); };
+  console.warn = (...a) => { dlog('WARN', a.map(String).join(' ')); ow.apply(console, a); };
+  window.addEventListener('error', e => dlog('JS', e.message));
+  window.addEventListener('unhandledrejection', e => dlog('REJ', (e.reason && e.reason.message) || e.reason));
+  renderer.debug.onShaderError = (gl, prog, vs, fs) => {
+    dlog('SHADER FAIL', (gl.getProgramInfoLog(prog) || '').trim(), '| FS:', (gl.getShaderInfoLog(fs) || '').slice(0, 240).trim(), '| VS:', (gl.getShaderInfoLog(vs) || '').slice(0, 120).trim());
+  };
+  try {
+    const gl = renderer.getContext(), dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    dlog('GL', gl.getParameter(gl.VERSION));
+    if (dbg) dlog('GPU', gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL));
+    dlog('maxTexSize', gl.getParameter(gl.MAX_TEXTURE_SIZE), '| varyings', gl.getParameter(gl.MAX_VARYING_VECTORS),
+         '| fragUnif', gl.getParameter(gl.MAX_FRAGMENT_UNIFORM_VECTORS), '| texUnits', gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS));
+  } catch (e) { dlog('cap err', e.message); }
+}
+
 const FOG_COLOR = new THREE.Color(0x5b5430);   // darker olive haze: distance fades into gloom rather than a bright yellow wash
 const scene = new THREE.Scene();
 scene.background = FOG_COLOR;
@@ -1434,6 +1461,7 @@ new GLTFLoader().load('backrooms_assets/chair_mp_1.glb', gltf => {
   chair.position.y += floorY - box.min.y;
   chair.traverse(o => {                                  // the GLB ships matte (metalness:0, roughness:1) with a dark wood texture -> a flat black silhouette. Give it specular + reflection so the IBL probe reveals its form, and lift the very dark albedo.
     if (!o.isMesh) return;
+    if (o.material.isMeshPhysicalMaterial) o.material = toStandard(o.material);   // downgrade so it compiles on mobile (see mobileSafeGltf)
     const m = o.material;
     m.roughness = Math.min(m.roughness ?? 1, 0.55);      // varnished-wood gloss so it catches a soft reflection (form), instead of rough:1 = pure diffuse
     m.metalness = 0.08;
@@ -1455,10 +1483,16 @@ function lampFromGltf(gltf) {
   geo.applyMatrix4(mesh.matrixWorld);
   return { geo, mat: mesh.material };
 }
-const loadGLB = file => new Promise((res, rej) => new GLTFLoader().load('backrooms_assets/' + file, gltf => { try { iosSafeGltf(gltf); } catch (e) { console.warn('texture POT pass failed for', file, e); } res(gltf); }, undefined, rej));
-// iOS Safari's WebGL renders materials whose textures are NOT power-of-two as blank/white (desktop GPUs
-// don't care). Several of the GLB textures are NPOT (e.g. the 682x517 wall map), so on load we redraw every
-// texture onto a power-of-two canvas. No-op for textures already POT, so desktop is visually unchanged.
+const loadGLB = file => new Promise((res, rej) => new GLTFLoader().load('backrooms_assets/' + file, gltf => { try { mobileSafeGltf(gltf); } catch (e) { console.warn('mobile material pass failed for', file, e); } res(gltf); }, undefined, rej));
+// Mobile GLB material fixes (white-models bug). Two problems show up on mobile WebKit/Gecko but not desktop:
+//  1) These GLB materials use KHR_materials_specular/ior, so GLTFLoader upgrades them to the heavy
+//     MeshPhysicalMaterial. Its shader has far more varyings/uniforms than MeshStandardMaterial, and mobile
+//     GPUs hit their lower shader limits and FAIL TO COMPILE -> the model renders white. The specular colour
+//     here is [0,0,0] (no specular) and there's no clearcoat/transmission, so we downgrade to a plain
+//     MeshStandardMaterial: visually identical, but lean enough to compile on phones. (Floor/ceiling already
+//     use MeshStandardMaterial, which is why those textures were fine.)
+//  2) Non-power-of-two textures (e.g. the 682x517 wall map) can also render blank on mobile, so we redraw
+//     each texture onto a power-of-two canvas (no-op when already POT -> desktop unchanged).
 const powTwoCeil = n => { let p = 1; while (p < n) p <<= 1; return p; };
 function makeTexPOT(tex) {
   if (!tex || !tex.image) return;
@@ -1473,11 +1507,31 @@ function makeTexPOT(tex) {
   if (MAX_ANISO) tex.anisotropy = Math.min(tex.anisotropy || 1, MAX_ANISO);
   tex.needsUpdate = true;
 }
-function iosSafeMaterial(mat) {
-  for (const k of ['map', 'emissiveMap', 'roughnessMap', 'metalnessMap', 'normalMap', 'aoMap', 'specularColorMap']) makeTexPOT(mat[k]);
+// Copy a MeshPhysicalMaterial down to a MeshStandardMaterial (same name so geoByMaterial still matches),
+// carrying over everything the scene actually uses. Non-physical materials pass through unchanged.
+function toStandard(mat) {
+  if (!mat || !mat.isMeshPhysicalMaterial) return mat;
+  const s = new THREE.MeshStandardMaterial();
+  s.name = mat.name;
+  s.map = mat.map; s.color.copy(mat.color);
+  s.roughness = mat.roughness; s.metalness = mat.metalness;
+  s.roughnessMap = mat.roughnessMap; s.metalnessMap = mat.metalnessMap;
+  s.normalMap = mat.normalMap; if (mat.normalMap) s.normalScale.copy(mat.normalScale);
+  s.aoMap = mat.aoMap; s.aoMapIntensity = mat.aoMapIntensity;
+  s.emissive.copy(mat.emissive); s.emissiveMap = mat.emissiveMap; s.emissiveIntensity = mat.emissiveIntensity;
+  s.alphaMap = mat.alphaMap; s.transparent = mat.transparent; s.opacity = mat.opacity; s.alphaTest = mat.alphaTest;
+  s.side = mat.side; s.flatShading = mat.flatShading; s.vertexColors = mat.vertexColors;
+  s.envMapIntensity = mat.envMapIntensity;
+  s.needsUpdate = true;
+  return s;
 }
-function iosSafeGltf(gltf) {
-  gltf.scene.traverse(o => { if (o.isMesh && o.material) (Array.isArray(o.material) ? o.material : [o.material]).forEach(iosSafeMaterial); });
+function iosSafeMaterial(mat) {   // POT pass for a single material's textures (used by the chair, loaded outside loadGLB)
+  for (const k of ['map', 'emissiveMap', 'roughnessMap', 'metalnessMap', 'normalMap', 'aoMap']) makeTexPOT(mat[k]);
+}
+function mobileSafeGltf(gltf) {   // downgrade physical->standard (cached per source material) + POT textures
+  const cache = new Map();
+  const conv = m => { let c = cache.get(m.uuid); if (!c) { c = toStandard(m); iosSafeMaterial(c); cache.set(m.uuid, c); } return c; };
+  gltf.scene.traverse(o => { if (o.isMesh && o.material) o.material = Array.isArray(o.material) ? o.material.map(conv) : conv(o.material); });
 }
 
 // Pull every primitive using the named material out of a loaded GLB, bake world matrices, and merge
@@ -1531,6 +1585,7 @@ const structLoad = USE_GLB_WALLS
       const wf = geoByMaterial(wg, 'wall_3'), wb = geoByMaterial(wg, 'door_frame_wood_1');
       const ps = geoByMaterial(pg, 'wall_3'), pb = geoByMaterial(pg, 'door_frame_wood_1');
       wallGlbGeo = wf.geo; wallGlbMat = wf.mat; installPoolLight(wallGlbMat);   // wall_3 shared by wall faces + pillar shafts + corner inner face
+      if (DIAG) { const t = wallGlbMat.map, im = t && t.image; dlog('wallMat', wallGlbMat.type, '| map', !!t, '| img', im && (im.constructor.name + ' ' + (im.width || 0) + 'x' + (im.height || 0)), '| cs', t && t.colorSpace, '| hasUV', !!(wallGlbGeo && wallGlbGeo.attributes.uv)); }
       pillarGlbGeo = ps.geo;
       wallBaseGeo = wb.geo; pillarBaseGeo = pb.geo;
       baseGlbMat = wb.mat; installPoolLight(baseGlbMat);                        // door_frame_wood shared by all baseboards

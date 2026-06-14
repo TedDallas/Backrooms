@@ -1450,7 +1450,7 @@ window.addEventListener('resize', () => { camera.aspect = window.innerWidth / wi
  * Loaded once at startup (async), placed deterministically off the spawn point. NOT part of the pure
  * generation layer — it's a fixed prop, not streamed/recomputed. Tune CHAIR_SCALE if it imports wrong-sized. */
 const CHAIR_SCALE = 1.0;   // GLB is metres if authored so; if the chair comes in giant/tiny, some exporters use cm -> try 0.01
-new GLTFLoader().load('backrooms_assets/chair_mp_1.glb', gltf => {
+loadGLB('chair_mp_1.glb').then(gltf => {
   const chair = gltf.scene;
   chair.scale.setScalar(CHAIR_SCALE);
   chair.updateMatrixWorld(true);
@@ -1471,7 +1471,7 @@ new GLTFLoader().load('backrooms_assets/chair_mp_1.glb', gltf => {
     m.needsUpdate = true;
   });
   scene.add(chair);
-}, undefined, err => console.error('chair_mp_1.glb failed to load:', err));
+}).catch(err => console.error('chair_mp_1.glb failed to load:', err));
 
 // Pull a single mesh's geometry + material out of a loaded GLB, baking the node transform so the bare
 // geometry is world-aligned and ready to instance.
@@ -1483,7 +1483,48 @@ function lampFromGltf(gltf) {
   geo.applyMatrix4(mesh.matrixWorld);
   return { geo, mat: mesh.material };
 }
-const loadGLB = file => new Promise((res, rej) => new GLTFLoader().load('backrooms_assets/' + file, gltf => { try { mobileSafeGltf(gltf); } catch (e) { console.warn('mobile material pass failed for', file, e); } res(gltf); }, undefined, rej));
+function loadGLB(file) {   // function declaration (hoisted) so the chair loader above can call it too
+  return fetch('backrooms_assets/' + file)
+    .then(r => { if (!r.ok) throw new Error(file + ' HTTP ' + r.status); return r.arrayBuffer(); })
+    .then(buf => new Promise((res, rej) => {
+      const done = gltf => { try { mobileSafeGltf(gltf); } catch (e) { console.warn('mobile material pass failed for', file, e); } res(gltf); };
+      let json = null; try { json = glbToInlineGltf(buf); } catch (e) { console.warn('GLB inline rewrite failed for', file, e); }
+      const loader = new GLTFLoader();
+      if (json) loader.parse(JSON.stringify(json), 'backrooms_assets/', done, rej);   // data-URI textures: no blob: (iOS-safe)
+      else loader.parse(buf, 'backrooms_assets/', done, rej);                          // fallback: raw GLB (blob path; desktop fine)
+    }));
+}
+// iOS Safari fails to load images from blob: URLs — which is exactly how GLTFLoader feeds it textures EMBEDDED
+// in a .glb (each image becomes a Blob + URL.createObjectURL). Desktop is fine; iPhone shows the models
+// untextured/white (diagnosed via #diag: "Couldn't load texture blob:" + "map false"). Fix: fetch the .glb,
+// rewrite every embedded image (and the binary buffer) as a self-contained data: URI, then hand the inline
+// glTF to GLTFLoader.parse — no blob URLs anywhere. Returns null for anything that isn't a plain binary GLB.
+function u8ToB64(bytes) {
+  let s = ''; const CH = 0x8000;                                  // chunk under the apply() arg-count limit
+  for (let i = 0; i < bytes.length; i += CH) s += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + CH, bytes.length)));
+  return btoa(s);
+}
+function glbToInlineGltf(buf) {
+  const dv = new DataView(buf);
+  if (dv.getUint32(0, true) !== 0x46546C67) return null;          // 'glTF' magic — not a binary GLB
+  const u8 = new Uint8Array(buf); let off = 12, json = null, bin = null;
+  while (off + 8 <= dv.byteLength) {
+    const clen = dv.getUint32(off, true), ctype = dv.getUint32(off + 4, true), start = off + 8;
+    if (ctype === 0x4E4F534A) json = JSON.parse(new TextDecoder().decode(u8.subarray(start, start + clen)));   // 'JSON'
+    else if (ctype === 0x004E4942) bin = u8.subarray(start, start + clen);                                     // 'BIN\0'
+    off = start + clen;
+  }
+  if (!json || !bin) return null;
+  (json.images || []).forEach(img => {
+    if (img.uri !== undefined || img.bufferView === undefined) return;
+    const bv = json.bufferViews[img.bufferView], o = bv.byteOffset || 0;
+    img.uri = 'data:' + (img.mimeType || 'image/png') + ';base64,' + u8ToB64(bin.subarray(o, o + bv.byteLength));
+    delete img.bufferView; delete img.mimeType;                   // now a data URI -> GLTFLoader skips the blob path
+  });
+  if (json.buffers && json.buffers[0] && json.buffers[0].uri === undefined)
+    json.buffers[0].uri = 'data:application/octet-stream;base64,' + u8ToB64(bin);   // self-contained: geometry buffer inline too
+  return json;
+}
 // Mobile GLB material fixes (white-models bug). Two problems show up on mobile WebKit/Gecko but not desktop:
 //  1) These GLB materials use KHR_materials_specular/ior, so GLTFLoader upgrades them to the heavy
 //     MeshPhysicalMaterial. Its shader has far more varyings/uniforms than MeshStandardMaterial, and mobile

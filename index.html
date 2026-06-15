@@ -52,6 +52,8 @@
     -webkit-user-select: none; -webkit-tap-highlight-color: transparent; text-shadow: 0 1px 2px #000; }
   #btnJump   { right: max(20px, env(safe-area-inset-right)); }
   #btnCrouch { right: calc(max(20px, env(safe-area-inset-right)) + 92px); }
+  #btnWalk   { left: max(20px, env(safe-area-inset-left)); }
+  #btnRun    { left: calc(max(20px, env(safe-area-inset-left)) + 92px); }
   .mbtn.active { background: rgba(255,240,150,0.5); color: #1a1705; border-color: rgba(255,250,210,0.85); }
 </style>
 
@@ -76,6 +78,8 @@
   <div class="enter">CLICK TO ENTER</div>
 </div>
 <div id="mobilectl">
+  <div id="btnWalk" class="mbtn">WALK</div>
+  <div id="btnRun" class="mbtn">RUN</div>
   <div id="btnCrouch" class="mbtn">CROUCH</div>
   <div id="btnJump" class="mbtn">JUMP</div>
 </div>
@@ -1254,7 +1258,7 @@ const MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
   || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)         // iPadOS reports as Mac
   || (window.matchMedia && window.matchMedia('(pointer: coarse)').matches)
   || location.hash.includes('mobile');                                            // force-on for testing
-let mobileActive = false, mobileCrouch = false, mobileJumpReq = false;
+let mobileActive = false, mobileCrouch = false, mobileJumpReq = false, mobileWalk = false, mobileRun = false;   // walk/run = auto-move-forward toggles (mutually exclusive)
 const mobileInput = { f: 0, r: 0, mag: 0 };   // f/r = unit move direction (forward/right), mag = 0..1 deflection
 let mYaw = 0, mPitch = 0;                      // live look angles while in mobile mode
 // Best-effort fullscreen. Works on Android/desktop browsers; iOS Safari doesn't support the Fullscreen
@@ -1281,18 +1285,21 @@ controls.addEventListener('lock', () => { overlay.style.display = 'none'; startA
 controls.addEventListener('unlock', () => { overlay.style.display = 'flex'; });
 if (MOBILE) {                                  // tailor the splash copy for touch
   const k = document.querySelector('#overlay .keys'), en = document.querySelector('#overlay .enter');
-  if (k) k.innerHTML = '<b>LEFT</b> half &mdash; move &nbsp;&nbsp; <b>RIGHT</b> half &mdash; look &nbsp;&nbsp; <b>BUTTONS</b> &mdash; crouch / jump';
+  if (k) k.innerHTML = '<b>LEFT</b> half &mdash; move &nbsp;&nbsp; <b>RIGHT</b> half &mdash; look<br/><b>WALK</b> / <b>RUN</b> &mdash; auto-move (look anywhere) &nbsp;&nbsp; <b>CROUCH</b> / <b>JUMP</b>';
   if (en) en.textContent = 'TAP TO ENTER';
 }
 if (MOBILE) {                                  // touch handlers: per-touch ids let one finger move while another looks
-  const cv = renderer.domElement, LOOK_SENS = 0.0042, JOY_R = 70;                 // JOY_R px from the touch origin = full-speed deflection
+  const cv = renderer.domElement, LOOK_SENS = 0.0084, JOY_R = 70;                 // JOY_R px from the touch origin = full-speed deflection
   let moveId = null, lookId = null, mSX = 0, mSY = 0, lLX = 0, lLY = 0;
   const resetMove = () => { mobileInput.f = mobileInput.r = mobileInput.mag = 0; };
   cv.addEventListener('touchstart', e => {
     e.preventDefault();
     for (const t of e.changedTouches) {
-      if (t.clientX < window.innerWidth / 2 && moveId === null) { moveId = t.identifier; mSX = t.clientX; mSY = t.clientY; resetMove(); }
-      else if (t.clientX >= window.innerWidth / 2 && lookId === null) { lookId = t.identifier; lLX = t.clientX; lLY = t.clientY; }
+      // WALK/RUN auto-move forward, so the left joystick isn't needed -> the whole screen becomes look-control.
+      // Otherwise the left half is the movement joystick and the right half is look.
+      const auto = mobileWalk || mobileRun;
+      if (!auto && t.clientX < window.innerWidth / 2 && moveId === null) { moveId = t.identifier; mSX = t.clientX; mSY = t.clientY; resetMove(); }
+      else if (lookId === null) { lookId = t.identifier; lLX = t.clientX; lLY = t.clientY; }
     }
   }, { passive: false });
   cv.addEventListener('touchmove', e => {
@@ -1319,9 +1326,13 @@ if (MOBILE) {                                  // touch handlers: per-touch ids 
   cv.addEventListener('touchend', endTouch);
   cv.addEventListener('touchcancel', endTouch);
   const bj = document.getElementById('btnJump'), bc = document.getElementById('btnCrouch');
+  const bw = document.getElementById('btnWalk'), br = document.getElementById('btnRun');
   const press = (el, fn) => { el.addEventListener('touchstart', e => { e.preventDefault(); fn(); }, { passive: false }); el.addEventListener('click', fn); };
   press(bj, () => { mobileJumpReq = true; });                                     // momentary: consumed once in updateMovement
   press(bc, () => { mobileCrouch = !mobileCrouch; bc.classList.toggle('active', mobileCrouch); }); // toggle
+  const syncMove = () => { bw.classList.toggle('active', mobileWalk); br.classList.toggle('active', mobileRun); };
+  press(bw, () => { mobileWalk = !mobileWalk; if (mobileWalk) mobileRun = false; resetMove(); syncMove(); }); // walk auto-move (mutually exclusive with run)
+  press(br, () => { mobileRun = !mobileRun; if (mobileRun) mobileWalk = false; resetMove(); syncMove(); });   // run auto-move
 }
 const keys = new Set();
 // --- debug free-fly camera (no pointer lock needed): G toggles; WASD/QE move, arrows look ---
@@ -1403,13 +1414,16 @@ function updateMovement(dt) {
   let fy = camera.position.y - eye;   // recover feet with the eye offset that produced the current camera height (keeps ground-snap exact through a crouch)
   const crouching = mobileActive ? mobileCrouch : rmbDown;   // desktop: hold RMB; mobile: the CROUCH button toggles. Drives eye height, crawl speed, and FOV below.
 
-  // movement input: keyboard (±1 per axis) on desktop, joystick (unit dir + 0..1 deflection) on mobile
+  // movement input: keyboard (±1 per axis) on desktop, joystick (unit dir + 0..1 deflection) on mobile.
+  // On mobile, the WALK/RUN toggles auto-move straight forward (so look can use the whole screen).
   let f, r, moveScale = 1;
-  if (mobileActive) { f = mobileInput.f; r = mobileInput.r; moveScale = mobileInput.mag; }
+  if (mobileActive && (mobileWalk || mobileRun)) { f = 1; r = 0; moveScale = 1; }   // auto-move forward
+  else if (mobileActive) { f = mobileInput.f; r = mobileInput.r; moveScale = mobileInput.mag; }
   else { f = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0); r = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0); }
   if (f || r) {
     let vx = fwd.x * f + rgt.x * r, vz = fwd.z * f + rgt.z * r;
-    const gait = crouching ? CROUCH_SPEED : (keys.has('ShiftLeft') || keys.has('ShiftRight') ? SPRINT : 1); // crouch crawl overrides sprint — you can't run while sneaking
+    const sprinting = mobileActive ? mobileRun : (keys.has('ShiftLeft') || keys.has('ShiftRight'));
+    const gait = crouching ? CROUCH_SPEED : (sprinting ? SPRINT : 1);   // crouch crawl overrides sprint — you can't run while sneaking
     const len = Math.hypot(vx, vz) || 1, spd = WALK * gait * dt * moveScale;   // mobile joystick scales speed by deflection; desktop moveScale stays 1
     [camera.position.x, camera.position.z] = moveWithCollision(camera.position.x, camera.position.z, vx / len * spd, vz / len * spd, fy, eye);  // eye = live head clearance: crouch (RMB / button) to duck under low stair soffits
   }
@@ -1450,7 +1464,7 @@ window.addEventListener('resize', () => { camera.aspect = window.innerWidth / wi
  * Loaded once at startup (async), placed deterministically off the spawn point. NOT part of the pure
  * generation layer — it's a fixed prop, not streamed/recomputed. Tune CHAIR_SCALE if it imports wrong-sized. */
 const CHAIR_SCALE = 1.0;   // GLB is metres if authored so; if the chair comes in giant/tiny, some exporters use cm -> try 0.01
-new GLTFLoader().load('backrooms_assets/chair_mp_1.glb', gltf => {
+loadGLB('chair_mp_1.glb').then(gltf => {
   const chair = gltf.scene;
   chair.scale.setScalar(CHAIR_SCALE);
   chair.updateMatrixWorld(true);
@@ -1471,7 +1485,7 @@ new GLTFLoader().load('backrooms_assets/chair_mp_1.glb', gltf => {
     m.needsUpdate = true;
   });
   scene.add(chair);
-}, undefined, err => console.error('chair_mp_1.glb failed to load:', err));
+}).catch(err => console.error('chair_mp_1.glb failed to load:', err));
 
 // Pull a single mesh's geometry + material out of a loaded GLB, baking the node transform so the bare
 // geometry is world-aligned and ready to instance.
@@ -1483,7 +1497,48 @@ function lampFromGltf(gltf) {
   geo.applyMatrix4(mesh.matrixWorld);
   return { geo, mat: mesh.material };
 }
-const loadGLB = file => new Promise((res, rej) => new GLTFLoader().load('backrooms_assets/' + file, gltf => { try { mobileSafeGltf(gltf); } catch (e) { console.warn('mobile material pass failed for', file, e); } res(gltf); }, undefined, rej));
+function loadGLB(file) {   // function declaration (hoisted) so the chair loader above can call it too
+  return fetch('backrooms_assets/' + file)
+    .then(r => { if (!r.ok) throw new Error(file + ' HTTP ' + r.status); return r.arrayBuffer(); })
+    .then(buf => new Promise((res, rej) => {
+      const done = gltf => { try { mobileSafeGltf(gltf); } catch (e) { console.warn('mobile material pass failed for', file, e); } res(gltf); };
+      let json = null; try { json = glbToInlineGltf(buf); } catch (e) { console.warn('GLB inline rewrite failed for', file, e); }
+      const loader = new GLTFLoader();
+      if (json) loader.parse(JSON.stringify(json), 'backrooms_assets/', done, rej);   // data-URI textures: no blob: (iOS-safe)
+      else loader.parse(buf, 'backrooms_assets/', done, rej);                          // fallback: raw GLB (blob path; desktop fine)
+    }));
+}
+// iOS Safari fails to load images from blob: URLs — which is exactly how GLTFLoader feeds it textures EMBEDDED
+// in a .glb (each image becomes a Blob + URL.createObjectURL). Desktop is fine; iPhone shows the models
+// untextured/white (diagnosed via #diag: "Couldn't load texture blob:" + "map false"). Fix: fetch the .glb,
+// rewrite every embedded image (and the binary buffer) as a self-contained data: URI, then hand the inline
+// glTF to GLTFLoader.parse — no blob URLs anywhere. Returns null for anything that isn't a plain binary GLB.
+function u8ToB64(bytes) {
+  let s = ''; const CH = 0x8000;                                  // chunk under the apply() arg-count limit
+  for (let i = 0; i < bytes.length; i += CH) s += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + CH, bytes.length)));
+  return btoa(s);
+}
+function glbToInlineGltf(buf) {
+  const dv = new DataView(buf);
+  if (dv.getUint32(0, true) !== 0x46546C67) return null;          // 'glTF' magic — not a binary GLB
+  const u8 = new Uint8Array(buf); let off = 12, json = null, bin = null;
+  while (off + 8 <= dv.byteLength) {
+    const clen = dv.getUint32(off, true), ctype = dv.getUint32(off + 4, true), start = off + 8;
+    if (ctype === 0x4E4F534A) json = JSON.parse(new TextDecoder().decode(u8.subarray(start, start + clen)));   // 'JSON'
+    else if (ctype === 0x004E4942) bin = u8.subarray(start, start + clen);                                     // 'BIN\0'
+    off = start + clen;
+  }
+  if (!json || !bin) return null;
+  (json.images || []).forEach(img => {
+    if (img.uri !== undefined || img.bufferView === undefined) return;
+    const bv = json.bufferViews[img.bufferView], o = bv.byteOffset || 0;
+    img.uri = 'data:' + (img.mimeType || 'image/png') + ';base64,' + u8ToB64(bin.subarray(o, o + bv.byteLength));
+    delete img.bufferView; delete img.mimeType;                   // now a data URI -> GLTFLoader skips the blob path
+  });
+  if (json.buffers && json.buffers[0] && json.buffers[0].uri === undefined)
+    json.buffers[0].uri = 'data:application/octet-stream;base64,' + u8ToB64(bin);   // self-contained: geometry buffer inline too
+  return json;
+}
 // Mobile GLB material fixes (white-models bug). Two problems show up on mobile WebKit/Gecko but not desktop:
 //  1) These GLB materials use KHR_materials_specular/ior, so GLTFLoader upgrades them to the heavy
 //     MeshPhysicalMaterial. Its shader has far more varyings/uniforms than MeshStandardMaterial, and mobile

@@ -89,6 +89,7 @@ import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
 
 /* ============================================================================
  * CONFIG
@@ -654,6 +655,12 @@ scene.fog = new THREE.FogExp2(FOG_COLOR.getHex(), FOG_DENSITY);
 const camera = new THREE.PerspectiveCamera(FOV, window.innerWidth / window.innerHeight, 0.1, 300);
 const SPAWN = findSpawn();
 camera.position.set(SPAWN.x, EYE, SPAWN.z);
+// The camera lives inside a "rig" Group. Flat-screen keeps the rig at identity, so moving camera.position
+// directly behaves exactly as before (world == local). In VR the headset owns the camera pose and we move
+// the RIG instead (see the VR section). playerWorld = the camera's WORLD position, used by streaming/HUD
+// (camera.position is now LOCAL to the rig, so streaming must read the world position instead).
+const rig = new THREE.Group(); rig.add(camera); scene.add(rig);
+const playerWorld = new THREE.Vector3(SPAWN.x, EYE, SPAWN.z);
 
 scene.add(new THREE.HemisphereLight(0xfff6c8, 0x9a8b3f, 0.32));  // subtle top-down gradient on top of the IBL probe below; kept dim so the room stays gloomy
 const ambient = new THREE.AmbientLight(0xfff3c0, 0.10); scene.add(ambient);   // tiny flat floor so nothing is pure black; the environment probe does the real ambient work
@@ -1216,8 +1223,8 @@ function buildOne(k, cx, cz, F) {
   scene.add(g); loaded.set(k, g);   // store even an empty group so the chunk isn't re-queued forever
 }
 function updateStreaming(immediate) {
-  const pf = Math.round((camera.position.y - EYE) / STORY_H);
-  const pcx = fdiv(camera.position.x, CHUNK * CELL), pcz = fdiv(camera.position.z, CHUNK * CELL);
+  const pf = Math.round((playerWorld.y - EYE) / STORY_H);
+  const pcx = fdiv(playerWorld.x, CHUNK * CELL), pcz = fdiv(playerWorld.z, CHUNK * CELL);
   const trig = pcx + '|' + pcz + '|' + pf;
   if (trig === lastKey && !immediate) return;   // no boundary crossed: nothing to (de)queue; processBuildQueue still drains any backlog every frame
   lastKey = trig;
@@ -1234,8 +1241,8 @@ function updateStreaming(immediate) {
 // Build queued chunk-floors nearest-first, only as many as fit in BUILD_BUDGET_MS — spreading a boundary crossing's burst across frames. Always builds at least one so the queue can't starve.
 function processBuildQueue() {
   if (!buildQueue.length) return;
-  const pf = Math.round((camera.position.y - EYE) / STORY_H);
-  const pcx = fdiv(camera.position.x, CHUNK * CELL), pcz = fdiv(camera.position.z, CHUNK * CELL);
+  const pf = Math.round((playerWorld.y - EYE) / STORY_H);
+  const pcx = fdiv(playerWorld.x, CHUNK * CELL), pcz = fdiv(playerWorld.z, CHUNK * CELL);
   const d2 = b => { const ax = b.cx - pcx, az = b.cz - pcz, af = b.F - pf; return ax * ax + az * az + af * af; };
   buildQueue.sort((a, b) => d2(b) - d2(a));   // farthest first so the cheap pop() from the tail yields the nearest
   const t0 = performance.now();
@@ -1452,13 +1459,13 @@ function updateHUD(dt) {
   hudFrames++; hudAcc += dt;
   if (hudAcc >= 0.5) {
     fps = Math.round(hudFrames / hudAcc); hudFrames = 0; hudAcc = 0;
-    const gx = fdiv(camera.position.x, CELL), gz = fdiv(camera.position.z, CELL), F = Math.round((camera.position.y - EYE) / STORY_H);
+    const gx = fdiv(playerWorld.x, CELL), gz = fdiv(playerWorld.z, CELL), F = Math.round((playerWorld.y - EYE) / STORY_H);
     hud.textContent = `FPS ${fps}  |  floor ${F}  |  ${ZONE_NAMES[zoneAt(gx, gz)]}  |  cell ${gx},${gz}  |  seed ${SEED}`;
   }
 }
 window.addEventListener('resize', () => { camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); });
 
-{ const gy = groundAt(camera.position.x, camera.position.z, 0.5); camera.position.y = (isFinite(gy) ? gy : 0) + EYE; }
+{ const gy = groundAt(camera.position.x, camera.position.z, 0.5); camera.position.y = (isFinite(gy) ? gy : 0) + EYE; playerWorld.copy(camera.position); }
 
 /* ---- runtime 3D-asset test: drop a chair on the floor ~1.2 m from spawn ---------------------------
  * Loaded once at startup (async), placed deterministically off the spawn point. NOT part of the pure
@@ -1616,11 +1623,136 @@ function installPoolLight(mat) {
   mat.needsUpdate = true;
 }
 
+/* ============================================================================
+ * VR (WebXR) — Quest 3. Everything here is gated on renderer.xr.isPresenting; the flat-screen/mobile
+ * paths are untouched. We move the RIG (the camera's parent) for locomotion/gravity/turn and let the
+ * headset drive the camera pose on top, reusing the existing moveWithCollision/groundAt physics.
+ * Controls: LEFT stick = glide (forward = where the LEFT controller points); hold LEFT grip = run;
+ * RIGHT stick L/R = smooth turn; A/X = jump; B/Y = crouch toggle (+ natural roomscale crouch).
+ * HEAD COLLIDER: if your real head pushes into a wall/column/ceiling, the view sticks at the surface,
+ * then eases back to your head (creeping, then exponential) once you pull out — eerie by design.
+ * ========================================================================== */
+const VR = {                       // tunables — safe to tweak live
+  TURN_SPEED: 2.2,                 // rad/s smooth turn at full right-stick
+  DEADZONE: 0.15,                  // thumbstick deadzone
+  HEAD_R: 0.18,                    // head-sphere radius (m) for the collider
+  CATCH_START: 0.7,                // catch-up rate the instant you un-stick (low -> it creeps at first)
+  CATCH_GROWTH: 1.06,              // per-frame exponential growth of the catch-up rate
+  CATCH_MAX: 8.0,                  // cap on catch-up rate (fast snap once it builds)
+  CROUCH_DROP: EYE - CROUCH_EYE,   // how far the B/Y crouch toggle lowers the view (m)
+};
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local-floor');   // floor at y=0, real standing height
+const vrAnchor = new THREE.Vector3(), vrReal = new THREE.Vector3(), vrDisplayed = new THREE.Vector3(),
+      vrStuck = new THREE.Vector3(), vrComfort = new THREE.Vector3(), vrHeadLocal = new THREE.Vector3();
+let vrYaw = 0, vrFloorY = 0, vrCrouch = false, vrCrouchDrop = 0, vrStuckOn = false, vrCatch = VR.CATCH_START;
+let vrJumpPrev = false, vrCrouchPrev = false, vrInit = false, vrFoveationSet = false;
+const VR_UP = new THREE.Vector3(0, 1, 0), _vq = new THREE.Quaternion(), _va = new THREE.Vector3(), _vb = new THREE.Vector3();
+const vrCtrl = [renderer.xr.getController(0), renderer.xr.getController(1)], vrSrc = [null, null];
+vrCtrl.forEach((c, i) => {
+  c.addEventListener('connected', e => { vrSrc[i] = e.data; });
+  c.addEventListener('disconnected', () => { vrSrc[i] = null; });
+  rig.add(c);                                                       // controllers ride locomotion/turn with the rig
+  const bar = new THREE.Mesh(new THREE.BoxGeometry(0.045, 0.045, 0.13), new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.7 }));
+  bar.position.z = -0.03; c.add(bar);                               // a small visible controller body
+  c.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -0.7)]), new THREE.LineBasicMaterial({ color: 0x8a86ff }))); // pointing ray
+});
+const vrGamepad = hand => { for (const s of vrSrc) if (s && s.handedness === hand && s.gamepad) return s.gamepad; return null; };
+const vrCtrlByHand = hand => { for (let i = 0; i < 2; i++) if (vrSrc[i] && vrSrc[i].handedness === hand) return vrCtrl[i]; return null; };
+const vrDz = v => Math.abs(v) < VR.DEADZONE ? 0 : v;
+const mobilectl = document.getElementById('mobilectl');
+renderer.xr.addEventListener('sessionstart', () => {
+  overlay.style.display = 'none'; if (mobilectl) mobilectl.style.display = 'none'; startAudio();
+  if (!vrFoveationSet) { try { renderer.xr.setFoveation(1); } catch (e) {} vrFoveationSet = true; }   // perf on Quest
+  vrAnchor.set(camera.position.x, 0, camera.position.z);            // seed from wherever the flat-screen camera was
+  const gy = groundAt(camera.position.x, camera.position.z, camera.position.y + STEP_UP);
+  vrFloorY = isFinite(gy) ? gy : 0;
+  vrYaw = 0; vy = 0; grounded = true; vrCrouch = false; vrCrouchDrop = 0;
+  vrStuckOn = false; vrCatch = VR.CATCH_START; vrComfort.set(0, 0, 0); vrInit = false;
+});
+renderer.xr.addEventListener('sessionend', () => {
+  rig.position.set(0, 0, 0); rig.rotation.set(0, 0, 0);            // back to flat-screen identity
+  camera.position.set(vrAnchor.x, vrFloorY + EYE, vrAnchor.z); camera.rotation.set(0, 0, 0);
+  overlay.style.display = 'flex'; if (mobilectl) mobilectl.style.display = mobileActive ? 'block' : 'none';
+});
+// True if a head-sphere at world (x,y,z) intrudes into a wall, grid column, or the ceiling of its room.
+function vrHeadHits(x, y, z) {
+  const gx = fdiv(x, CELL), gz = fdiv(z, CELL), lx = x - gx * CELL, lz = z - gz * CELL, R = VR.HEAD_R;
+  if (CELL - lx < R && wallXAt(gx, gz, 1, y)) return true;          // walls of this cell at head height
+  if (lx < R && wallXAt(gx, gz, -1, y)) return true;
+  if (CELL - lz < R && wallZAt(gx, gz, 1, y)) return true;
+  if (lz < R && wallZAt(gx, gz, -1, y)) return true;
+  const colF = Math.round(y / STORY_H);
+  for (let ox = 0; ox <= 1; ox++) for (let oz = 0; oz <= 1; oz++) {
+    const cxx = gx + ox, czz = gz + oz;
+    if (columnAt(cxx, czz, colF) && Math.abs(x - cxx * CELL) < COL_W / 2 + R && Math.abs(z - czz * CELL) < COL_W / 2 + R) return true;
+  }
+  const F = Math.round((y - 1.2) / STORY_H), Fb = roomBaseFloor(gx, gz, F), st = roomStoriesAt(gx, gz, Fb);   // ceiling
+  if (st > 0 && y + R > Fb * STORY_H + ceilStoriesH(st) - SLAB) return true;
+  return false;
+}
+function updateVR(dt) {
+  vrHeadLocal.copy(camera.position);                               // pure headset pose within the rig (XR-driven)
+  const gpL = vrGamepad('left'), gpR = vrGamepad('right');
+  const sx = gpL && gpL.axes.length >= 4 ? vrDz(gpL.axes[2]) : 0, sy = gpL && gpL.axes.length >= 4 ? vrDz(gpL.axes[3]) : 0;
+  const turnX = gpR && gpR.axes.length >= 4 ? vrDz(gpR.axes[2]) : 0;
+  const run = !!(gpL && gpL.buttons[1] && gpL.buttons[1].value > 0.5);                                  // left grip
+  const jumpBtn = !!((gpR && gpR.buttons[4] && gpR.buttons[4].pressed) || (gpL && gpL.buttons[4] && gpL.buttons[4].pressed)); // A / X
+  const crouchBtn = !!((gpR && gpR.buttons[5] && gpR.buttons[5].pressed) || (gpL && gpL.buttons[5] && gpL.buttons[5].pressed)); // B / Y
+
+  vrYaw -= turnX * VR.TURN_SPEED * dt; rig.rotation.y = vrYaw;      // smooth turn
+  if (crouchBtn && !vrCrouchPrev) vrCrouch = !vrCrouch;             // crouch toggle (edge)
+  vrCrouchPrev = crouchBtn;
+  vrCrouchDrop += ((vrCrouch ? VR.CROUCH_DROP : 0) - vrCrouchDrop) * Math.min(1, CROUCH_RATE * dt);
+
+  if (sx || sy) {                                                   // glide along the LEFT controller's pointing direction
+    const cl = vrCtrlByHand('left');
+    if (cl) { _va.set(0, 0, -1).applyQuaternion(cl.getWorldQuaternion(_vq)); _va.y = 0; if (_va.lengthSq() < 1e-6) _va.set(-Math.sin(vrYaw), 0, -Math.cos(vrYaw)); _va.normalize(); }
+    else _va.set(-Math.sin(vrYaw), 0, -Math.cos(vrYaw));
+    const fx = _va.x, fz = _va.z, rx = -fz, rz = fx;               // right = forward x up
+    let vx = fx * (-sy) + rx * sx, vz = fz * (-sy) + rz * sx;
+    const len = Math.hypot(vx, vz) || 1, mag = Math.min(Math.hypot(sx, sy), 1);
+    const headClear = Math.max(0.3, vrHeadLocal.y - vrCrouchDrop), spd = WALK * (run ? SPRINT : 1) * dt * mag;
+    const [nx, nz] = moveWithCollision(vrAnchor.x, vrAnchor.z, vx / len * spd, vz / len * spd, vrFloorY, headClear);
+    vrAnchor.x = nx; vrAnchor.z = nz;
+  }
+
+  if (grounded && jumpBtn && !vrJumpPrev) { vy = JUMP; grounded = false; }   // jump (edge)
+  vrJumpPrev = jumpBtn;
+  vy -= GRAVITY * dt; if (vy < -TERMINAL) vy = -TERMINAL;
+  let nfy = vrFloorY + vy * dt;
+  const g = groundAt(vrAnchor.x, vrAnchor.z, vrFloorY + STEP_UP);
+  if (g > -Infinity && nfy <= g) { nfy = g; vy = 0; grounded = true; }
+  else if (g > -Infinity && grounded && vy <= 0 && g >= vrFloorY - SNAP_DOWN) { nfy = g; vy = 0; }
+  else grounded = false;
+  vrFloorY = nfy;
+
+  const baseY = vrFloorY - vrCrouchDrop;                           // real (un-stuck) head world pos = rig base + yaw-rotated head pose
+  _vb.copy(vrHeadLocal).applyAxisAngle(VR_UP, vrYaw);
+  vrReal.set(vrAnchor.x + _vb.x, baseY + _vb.y, vrAnchor.z + _vb.z);
+  if (!vrInit) { vrDisplayed.copy(vrReal); vrInit = true; }
+
+  if (vrHeadHits(vrReal.x, vrReal.y, vrReal.z)) {                  // stick at the surface while the real head is inside
+    if (!vrStuckOn) { vrStuck.copy(vrDisplayed); vrStuckOn = true; }
+    vrDisplayed.copy(vrStuck); vrCatch = VR.CATCH_START;
+  } else if (vrStuckOn || vrDisplayed.distanceToSquared(vrReal) > 1e-5) {   // free again -> chase the head: creep, then exponential
+    vrCatch = Math.min(vrCatch * VR.CATCH_GROWTH, VR.CATCH_MAX);
+    vrDisplayed.lerp(vrReal, Math.min(vrCatch * dt, 1));
+    if (vrDisplayed.distanceToSquared(vrReal) < 1e-5) { vrDisplayed.copy(vrReal); vrStuckOn = false; vrCatch = VR.CATCH_START; }
+  } else vrDisplayed.copy(vrReal);
+  vrComfort.copy(vrDisplayed).sub(vrReal);                         // offset that pins/eases the view
+
+  rig.position.set(vrAnchor.x + vrComfort.x, baseY + vrComfort.y, vrAnchor.z + vrComfort.z);
+  rig.updateMatrixWorld(true);
+}
+document.body.appendChild(VRButton.createButton(renderer));        // "ENTER VR" button (hidden/greyed where unsupported)
+
 let frameErrLogged = false;
 function frame() {
   const now = performance.now(); let dt = (now - prevT) / 1000; prevT = now; if (dt > 0.05) dt = 0.05;
   try {
-    if (controls.isLocked || mobileActive) updateMovement(dt);
+    if (renderer.xr.isPresenting) { updateVR(dt); camera.updateWorldMatrix(true, false); camera.getWorldPosition(playerWorld); }
+    else { if (controls.isLocked || mobileActive) updateMovement(dt); playerWorld.copy(camera.position); }
     updateStreaming(); processBuildQueue(); flickerTick(now / 1000); lightUniforms.uTime.value = now / 1000; updateHUD(dt);
     renderer.render(scene, camera);
   } catch (e) {   // never let one bad frame kill the render loop (a thrown error stops requestAnimationFrame -> looks like a hard freeze)

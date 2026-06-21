@@ -1628,12 +1628,9 @@ function installPoolLight(mat) {
  * paths are untouched. We move the RIG (the camera's parent) for locomotion/gravity/turn and let the
  * headset drive the camera pose on top, reusing the existing moveWithCollision/groundAt physics.
  * Controls: LEFT stick = glide (forward = where the LEFT controller points); hold LEFT grip = run;
- * RIGHT stick L/R = smooth turn; A/X = jump; B/Y = crouch toggle (+ natural roomscale crouch);
- * TRIGGER (either hand) = manually drop a real-obstacle pillar at that hand.
+ * RIGHT stick L/R = smooth turn; A/X = jump; B/Y = crouch toggle (+ natural roomscale crouch).
  * HEAD COLLIDER: if your real head pushes into a wall/column/ceiling, the view sticks at the surface,
  * then eases back to your head (creeping, then exponential) once you pull out — eerie by design.
- * REAL-OBSTACLE PILLARS: a sharp physical bump (auto) or a trigger press (manual) drops a Backrooms pillar
- * locked to your real play-space, so real walls/furniture become a constellation that follows you.
  * ========================================================================== */
 const VR = {                       // tunables — safe to tweak live
   TURN_SPEED: 2.2,                 // rad/s smooth turn at full right-stick
@@ -1643,15 +1640,6 @@ const VR = {                       // tunables — safe to tweak live
   CATCH_GROWTH: 1.06,              // per-frame exponential growth of the catch-up rate
   CATCH_MAX: 8.0,                  // cap on catch-up rate (fast snap once it builds)
   CROUCH_DROP: EYE - CROUCH_EYE,   // how far the B/Y crouch toggle lowers the view (m)
-  // Real-obstacle pillars: a physical bump (or a deliberate trigger press) drops a Backrooms pillar locked
-  // to your real play-space, so real walls/furniture become a constellation that follows you. Easter-egg /
-  // soft guardian — NOT a safety system (Quest's Guardian is). Bump = a sharp deceleration of the REAL head.
-  BUMP_MINSPEED: 0.55,             // m/s the head must have been moving for a stop to count as a bump
-  BUMP_DECEL: 16,                  // m/s^2 deceleration spike that flags a physical impact (tune on-device)
-  BUMP_COOLDOWN: 0.8,              // s between auto-placed pillars (debounce one bump -> one pillar)
-  MARKER_REACH: 0.30,             // m ahead of the head to plant an auto pillar (face/arm reach)
-  MARKER_MERGE: 0.6,              // don't place a new pillar within this many m of an existing one
-  MARKER_MAX: 48,                  // cap; oldest is recycled past this
 };
 renderer.xr.enabled = true;
 renderer.xr.setReferenceSpaceType('local-floor');   // floor at y=0, real standing height
@@ -1659,11 +1647,7 @@ const vrAnchor = new THREE.Vector3(), vrReal = new THREE.Vector3(), vrDisplayed 
       vrStuck = new THREE.Vector3(), vrComfort = new THREE.Vector3(), vrHeadLocal = new THREE.Vector3();
 let vrYaw = 0, vrFloorY = 0, vrCrouch = false, vrCrouchDrop = 0, vrStuckOn = false, vrCatch = VR.CATCH_START;
 let vrJumpPrev = false, vrCrouchPrev = false, vrInit = false, vrFoveationSet = false;
-const VR_UP = new THREE.Vector3(0, 1, 0), _vq = new THREE.Quaternion(), _va = new THREE.Vector3(), _vb = new THREE.Vector3(), _vc = new THREE.Vector3();
-// real-obstacle pillars (see VR tunables): velocity-tracked bump detection + manual trigger, play-space-locked
-const vrMarkers = [], vrHeadPrevLocal = new THREE.Vector3(), vrHeadVel = new THREE.Vector3();
-let vrBumpCool = 0, vrTrigPrevL = false, vrTrigPrevR = false, vrBumpQueued = false, vrBumpLX = 0, vrBumpLZ = 0;
-const vrMarkerMat = new THREE.MeshStandardMaterial({ map: makeConcrete(), roughness: 0.92, metalness: 0, emissive: 0x130b05, emissiveIntensity: 0.55 });
+const VR_UP = new THREE.Vector3(0, 1, 0), _vq = new THREE.Quaternion(), _va = new THREE.Vector3(), _vb = new THREE.Vector3();
 const vrCtrl = [renderer.xr.getController(0), renderer.xr.getController(1)], vrSrc = [null, null];
 vrCtrl.forEach((c, i) => {
   c.addEventListener('connected', e => { vrSrc[i] = e.data; });
@@ -1685,26 +1669,12 @@ renderer.xr.addEventListener('sessionstart', () => {
   vrFloorY = isFinite(gy) ? gy : 0;
   vrYaw = 0; vy = 0; grounded = true; vrCrouch = false; vrCrouchDrop = 0;
   vrStuckOn = false; vrCatch = VR.CATCH_START; vrComfort.set(0, 0, 0); vrInit = false;
-  vrClearMarkers(); vrHeadPrevLocal.copy(camera.position); vrHeadVel.set(0, 0, 0); vrBumpCool = 0; vrBumpQueued = false; vrTrigPrevL = vrTrigPrevR = false;
 });
 renderer.xr.addEventListener('sessionend', () => {
   rig.position.set(0, 0, 0); rig.rotation.set(0, 0, 0);            // back to flat-screen identity
   camera.position.set(vrAnchor.x, vrFloorY + EYE, vrAnchor.z); camera.rotation.set(0, 0, 0);
-  vrClearMarkers();
   overlay.style.display = 'flex'; if (mobilectl) mobilectl.style.display = mobileActive ? 'block' : 'none';
 });
-function vrClearMarkers() { for (const m of vrMarkers) { rig.remove(m); m.geometry.dispose(); } vrMarkers.length = 0; }
-// Drop a real-obstacle pillar at world (wx,wz), floor-to-ceiling, parented to the rig so it stays locked to
-// your real play-space (it travels with you through the maze, marking where your real obstacle is).
-function vrPlaceMarkerWorld(wx, wz) {
-  for (const m of vrMarkers) { m.getWorldPosition(_vc); if ((_vc.x - wx) ** 2 + (_vc.z - wz) ** 2 < VR.MARKER_MERGE * VR.MARKER_MERGE) return; }   // dedup
-  const gx = fdiv(wx, CELL), gz = fdiv(wz, CELL), F = Math.round(vrFloorY / STORY_H), Fb = roomBaseFloor(gx, gz, F), st = roomStoriesAt(gx, gz, Fb);
-  const ceilY = st > 0 ? Fb * STORY_H + ceilStoriesH(st) - SLAB : vrFloorY + STORY_H, h = Math.max(STORY_H * 0.5, ceilY - vrFloorY);
-  const mesh = new THREE.Mesh(new THREE.BoxGeometry(COL_W, h, COL_W), vrMarkerMat);
-  rig.worldToLocal(_vc.set(wx, vrFloorY + h / 2, wz)); mesh.position.copy(_vc);   // world -> rig-local (play-space anchored)
-  rig.add(mesh); vrMarkers.push(mesh);
-  if (vrMarkers.length > VR.MARKER_MAX) { const old = vrMarkers.shift(); rig.remove(old); old.geometry.dispose(); }
-}
 // True if a head-sphere at world (x,y,z) intrudes into a wall, grid column, or the ceiling of its room.
 function vrHeadHits(x, y, z) {
   const gx = fdiv(x, CELL), gz = fdiv(z, CELL), lx = x - gx * CELL, lz = z - gz * CELL, R = VR.HEAD_R;
@@ -1729,20 +1699,6 @@ function updateVR(dt) {
   const run = !!(gpL && gpL.buttons[1] && gpL.buttons[1].value > 0.5);                                  // left grip
   const jumpBtn = !!((gpR && gpR.buttons[4] && gpR.buttons[4].pressed) || (gpL && gpL.buttons[4] && gpL.buttons[4].pressed)); // A / X
   const crouchBtn = !!((gpR && gpR.buttons[5] && gpR.buttons[5].pressed) || (gpL && gpL.buttons[5] && gpL.buttons[5].pressed)); // B / Y
-  const trigL = !!(gpL && gpL.buttons[0] && gpL.buttons[0].pressed), trigR = !!(gpR && gpR.buttons[0] && gpR.buttons[0].pressed); // triggers = manual marker
-
-  // physical head velocity: camera.position is reference-space, so this is REAL head movement only (never
-  // virtual locomotion). A sharp deceleration = a physical bump -> queue a real-obstacle pillar ahead of it.
-  _vc.copy(vrHeadLocal).sub(vrHeadPrevLocal).divideScalar(Math.max(dt, 1e-3));
-  const prevSpeed = vrHeadVel.length();
-  if (vrBumpCool > 0) vrBumpCool -= dt;
-  if (vrBumpCool <= 0 && prevSpeed > VR.BUMP_MINSPEED && (prevSpeed - _vc.length()) / Math.max(dt, 1e-3) > VR.BUMP_DECEL) {
-    _vb.copy(vrHeadVel); _vb.y = 0;
-    if (_vb.lengthSq() > 1e-6) { _vb.normalize(); vrBumpLX = vrHeadLocal.x + _vb.x * VR.MARKER_REACH; vrBumpLZ = vrHeadLocal.z + _vb.z * VR.MARKER_REACH; }
-    else { vrBumpLX = vrHeadLocal.x; vrBumpLZ = vrHeadLocal.z; }
-    vrBumpQueued = true; vrBumpCool = VR.BUMP_COOLDOWN;
-  }
-  vrHeadVel.copy(_vc); vrHeadPrevLocal.copy(vrHeadLocal);
 
   vrYaw -= turnX * VR.TURN_SPEED * dt; rig.rotation.y = vrYaw;      // smooth turn
   if (crouchBtn && !vrCrouchPrev) vrCrouch = !vrCrouch;             // crouch toggle (edge)
@@ -1788,12 +1744,6 @@ function updateVR(dt) {
 
   rig.position.set(vrAnchor.x + vrComfort.x, baseY + vrComfort.y, vrAnchor.z + vrComfort.z);
   rig.updateMatrixWorld(true);
-
-  // place pending real-obstacle pillars now that the rig transform is final (auto bump + manual triggers)
-  if (vrBumpQueued) { rig.localToWorld(_vc.set(vrBumpLX, 0, vrBumpLZ)); vrPlaceMarkerWorld(_vc.x, _vc.z); vrBumpQueued = false; }
-  if (trigR && !vrTrigPrevR) { const c = vrCtrlByHand('right'); if (c) { c.getWorldPosition(_vc); vrPlaceMarkerWorld(_vc.x, _vc.z); } }
-  if (trigL && !vrTrigPrevL) { const c = vrCtrlByHand('left'); if (c) { c.getWorldPosition(_vc); vrPlaceMarkerWorld(_vc.x, _vc.z); } }
-  vrTrigPrevR = trigR; vrTrigPrevL = trigL;
 }
 document.body.appendChild(VRButton.createButton(renderer));        // "ENTER VR" button (hidden/greyed where unsupported)
 

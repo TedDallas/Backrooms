@@ -1745,7 +1745,13 @@ function updateVR(dt) {
   rig.position.set(vrAnchor.x + vrComfort.x, baseY + vrComfort.y, vrAnchor.z + vrComfort.z);
   rig.updateMatrixWorld(true);
 }
-document.body.appendChild(VRButton.createButton(renderer));        // "ENTER VR" button (hidden/greyed where unsupported)
+// Only add the "ENTER VR" button where immersive VR actually works (e.g. the Quest); on desktop/mobile
+// without WebXR we add nothing rather than show VRButton's "VR NOT SUPPORTED" / "WEBXR NOT AVAILABLE" label.
+if (navigator.xr && navigator.xr.isSessionSupported) {
+  navigator.xr.isSessionSupported('immersive-vr')
+    .then(ok => { if (ok) document.body.appendChild(VRButton.createButton(renderer)); })
+    .catch(() => {});
+}
 
 let frameErrLogged = false;
 function frame() {

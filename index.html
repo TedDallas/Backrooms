@@ -663,7 +663,7 @@ const rig = new THREE.Group(); rig.add(camera); scene.add(rig);
 const playerWorld = new THREE.Vector3(SPAWN.x, EYE, SPAWN.z);
 
 scene.add(new THREE.HemisphereLight(0xfff6c8, 0x9a8b3f, 0.32));  // subtle top-down gradient on top of the IBL probe below; kept dim so the room stays gloomy
-const ambient = new THREE.AmbientLight(0xfff3c0, 0.10); scene.add(ambient);   // tiny flat floor so nothing is pure black; the environment probe does the real ambient work
+const ambient = new THREE.AmbientLight(0xfff3c0, 0.30); scene.add(ambient);   // flat fill so the dark-albedo GLB models (walls/pillars/props) aren't crushed; the environment probe adds the rest
 const hemi = scene.children.find(o => o.isHemisphereLight);
 
 // --- Image-based lighting (IBL) -----------------------------------------------------------------
@@ -1407,7 +1407,7 @@ function flickerTick(t) {
   if (t > flick.next) { flick.until = t + 0.04 + Math.random() * 0.12; flick.next = t + 2 + Math.random() * 6; }
   const on = t > flick.until;
   if (lampOnMat) lampOnMat.emissiveIntensity = flick.base * (on ? 0.9 + 0.1 * Math.random() : 0.3); // global subtle pulse on the ON fixtures (set once they've loaded)
-  hemi.intensity = on ? 0.32 : 0.22;
+  hemi.intensity = on ? 0.46 : 0.34;   // raised: more top-down fill on the models (flicker still dips it)
 }
 
 /* ============================================================================
@@ -1613,7 +1613,7 @@ function geoByMaterial(gltf, matName) {
 // Give a swapped-in structural material the same baked lamp-pool light as the procedural surfaces
 // (instanceColor.g) plus a touch of IBL reflection, so it lights identically to everything else.
 function installPoolLight(mat) {
-  mat.envMapIntensity = 1.0;
+  mat.envMapIntensity = 1.5;   // more room-probe reflection so the dark-textured walls/pillars/stairs read brighter
   mat.onBeforeCompile = (shader) => {
     shader.fragmentShader = shader.fragmentShader
       .replace('#include <color_fragment>', '')                 // instanceColor carries baked light, not a tint

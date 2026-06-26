@@ -647,7 +647,7 @@ if (DIAG) {
   } catch (e) { dlog('cap err', e.message); }
 }
 
-const FOG_COLOR = new THREE.Color(0x5b5430);   // darker olive haze: distance fades into gloom rather than a bright yellow wash
+const FOG_COLOR = new THREE.Color(0xdedac4);   // very light gray with a hint of yellow: distance fades to a pale haze, not gloom
 const scene = new THREE.Scene();
 scene.background = FOG_COLOR;
 scene.fog = new THREE.FogExp2(FOG_COLOR.getHex(), FOG_DENSITY);
@@ -663,7 +663,7 @@ const rig = new THREE.Group(); rig.add(camera); scene.add(rig);
 const playerWorld = new THREE.Vector3(SPAWN.x, EYE, SPAWN.z);
 
 scene.add(new THREE.HemisphereLight(0xfff6c8, 0x9a8b3f, 0.32));  // subtle top-down gradient on top of the IBL probe below; kept dim so the room stays gloomy
-const ambient = new THREE.AmbientLight(0xfff3c0, 0.30); scene.add(ambient);   // flat fill so the dark-albedo GLB models (walls/pillars/props) aren't crushed; the environment probe adds the rest
+const ambient = new THREE.AmbientLight(0xfff3c0, 0.85); scene.add(ambient);   // strong flat fill so the dark-albedo GLB models (walls/pillars/props/chair/lamps) read clearly
 const hemi = scene.children.find(o => o.isHemisphereLight);
 
 // --- Image-based lighting (IBL) -----------------------------------------------------------------
@@ -1402,7 +1402,7 @@ function startAudio() {
   const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1000; bp.Q.value = 0.6;
   const ng = ctx.createGain(); ng.gain.value = 0.05; nz.connect(bp).connect(ng).connect(master); nz.start();
 }
-const flick = { next: 0, until: 0, base: 0.7 };
+const flick = { next: 0, until: 0, base: 1.15 };   // brighter lit-lamp glow (was 0.7)
 function flickerTick(t) {
   if (t > flick.next) { flick.until = t + 0.04 + Math.random() * 0.12; flick.next = t + 2 + Math.random() * 6; }
   const on = t > flick.until;
@@ -1486,8 +1486,9 @@ loadGLB('chair_mp_1.glb').then(gltf => {
     const m = o.material;
     m.roughness = Math.min(m.roughness ?? 1, 0.55);      // varnished-wood gloss so it catches a soft reflection (form), instead of rough:1 = pure diffuse
     m.metalness = 0.08;
-    m.envMapIntensity = 1.5;                             // drink in a bit more of the room probe than the walls do
-    if (m.color) m.color.multiplyScalar(1.7);            // brighten the near-black wood-stain texture off the floor of the histogram
+    m.envMapIntensity = 2.4;                             // drink in more of the room probe than the walls do
+    if (m.color) m.color.multiplyScalar(2.8);            // strongly lift the near-black wood-stain texture
+    m.emissive = new THREE.Color(0x3a3026); m.emissiveIntensity = 0.5;   // faint self-glow so the dark wood never crushes to black
     iosSafeMaterial(m);                                  // power-of-two textures so the chair isn't white on iOS Safari
     m.needsUpdate = true;
   });
@@ -1833,8 +1834,8 @@ Promise.all([loadGLB('ceiling_lamp_4_on.glb'), loadGLB('ceiling_lamp_4_off.glb')
     lampOnGeo = on.geo; lampOnMat = on.mat; installLampFlicker(lampOnMat);
     lampOffGeo = off.geo; lampOffMat = off.mat;
     for (const m of [lampOnMat, lampOffMat]) {            // metal housings ship matte (roughness:1) -> flat black. Give them a touch of gloss + reflection so the IBL probe reads them as fixtures, not dark blobs. (The ON tube's emissive is untouched.)
-      m.roughness = 0.6; m.envMapIntensity = 1.2;
-      if (m.color) m.color.multiplyScalar(1.25);
+      m.roughness = 0.55; m.envMapIntensity = 2.4;        // much more reflection so the dark metal housing reads as a fixture, not a blob
+      if (m.color) m.color.multiplyScalar(2.4);           // strongly lift the near-black housing albedo
       m.needsUpdate = true;
     }
   })

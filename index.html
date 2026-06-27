@@ -160,7 +160,7 @@ const hash01 = (x, y, salt) => hashInt(x, y, salt) / 4294967296;
 const fdiv = (a, b) => Math.floor(a / b);
 const fmod = (a, b) => ((a % b) + b) % b;
 
-const SALT_E = 11, SALT_N = 22, SALT_CARVE = 33, SALT_ZONE = 44, SALT_TALL = 55, SALT_STAIR = 66, SALT_LIGHT = 77, SALT_STAIRROT = 88, SALT_CORNER = 111, SALT_ZONE2 = 122, SALT_RUNX = 133, SALT_RUNZ = 144, SALT_CARVE2 = 155, SALT_FLOW = 166;
+const SALT_E = 11, SALT_N = 22, SALT_CARVE = 33, SALT_ZONE = 44, SALT_TALL = 55, SALT_STAIR = 66, SALT_LIGHT = 77, SALT_STAIRROT = 88, SALT_CORNER = 111, SALT_ZONE2 = 122, SALT_RUNX = 133, SALT_RUNZ = 144, SALT_CARVE2 = 155, SALT_FLOW = 166, SALT_FLOOR = 177;
 const CORNER_P_NORMAL = 0.60;          // chance an eligible even/even inside-corner gets the rounded-corner model (NORMAL zones) — bumped for a more curvy NORMAL
 const CORNER_P_ODD = 0.14;             // ... rarer in PILLARS / WRONG zones (0 in ATRIUM / elsewhere)
 const FLOORMIX = 0x9e3779b1;            // mixes the floor index into per-floor salts
@@ -181,6 +181,16 @@ function zoneAt(gx, gz) {
   if (r < 0.40) return Z_ATRIUM;
   if (r < 0.73) return Z_PILLARS;
   return Z_WRONG;
+}
+// Floor theme per AREA: 0 = default carpet, 1..3 = floor-tile models. Keyed to the zone region (mirrors
+// zoneAt's two-tier tiling) so a whole contiguous area shares ONE floor, and the same area type in a
+// different region can land on a different theme. Pure fn of cell + SEED -> regenerates identically.
+function floorThemeAt(gx, gz) {
+  const cgx = fdiv(gx, NZONE), cgz = fdiv(gz, NZONE);
+  const key = hash01(cgx, cgz, SALT_ZONE) < NORMAL_BIG_P + BENDS_BIG_P   // coarse NORMAL/BENDS region -> one key
+    ? hashInt(cgx, cgz, SALT_FLOOR)
+    : hashInt(fdiv(gx, ZONE_SIZE), fdiv(gz, ZONE_SIZE), SALT_FLOOR);     // else the fine special tile
+  return key % 4;
 }
 
 /* ============================================================================
@@ -949,6 +959,9 @@ const wallGeo  = new THREE.BoxGeometry(CELL, CEIL_NORMAL, WALL_THICK); // base h
 const colGeo   = new THREE.BoxGeometry(COL_W, CEIL_NORMAL, COL_W);
 const slabGeo  = new THREE.BoxGeometry(CELL, SLAB, CELL);          // floor slab: carpet top, concrete sides + underside
 const slabMats = [concreteMat, concreteMat, floorMat, concreteMat, concreteMat, concreteMat]; // box face order: +x,-x,+y,-y,+z,-z
+const slabConcreteMats = [concreteMat, concreteMat, concreteMat, concreteMat, concreteMat, concreteMat]; // tile themes: concrete TOP too (the tile model covers it; gaps show concrete, not carpet)
+// Floor-tile models (floor_ceiling_1/2/3.glb): per-theme surface geo+material, set once loaded. Theme 0 = carpet (none).
+const tileFloorGeo = [null, null, null, null], tileFloorMat = [null, null, null, null];
 const dummy = new THREE.Object3D();
 const tmpCol = new THREE.Color();
 
@@ -1050,6 +1063,7 @@ function buildChunkFloor(cx, cz, F) {
   const bX = cx * CHUNK, bZ = cz * CHUNK, y0 = F * STORY_H;
   const floors = [], ceils = [], walls = [], wallsAtrium = [], cols = [], colsPlain = [], colsPillars = [], colsAtrium = [], lampsOn = [], lampsOff = [], stairsS = [], stairsW = [], corners = [];
   const wallBases = [], pillarBases = [], pillarBases3 = [];   // model baseboards: pillarBases = pillar_1 (door_frame), pillarBases3 = pillar_3 (painted)
+  const floorsConc = [], floorTiles = [null, [], [], []];      // tile-theme cells: concrete-top slab + per-theme tile surface
   const doCorners = !!cornerInnerGeo;                      // corner GLB loaded (implies USE_GLB_WALLS) -> swap eligible L-corners + suppress their straight walls
 
   for (let lz = 0; lz < CHUNK; lz++) for (let lx = 0; lx < CHUNK; lx++) {
@@ -1057,7 +1071,11 @@ function buildChunkFloor(cx, cz, F) {
     if (st === 0) continue;                                   // void cell: rendered by the room below
     const cxw = (gx + 0.5) * CELL, czw = (gz + 0.5) * CELL, ceilY = y0 + ceilStoriesH(st) - SLAB - SLAB_EPS; // drop the ceiling under the slab above
     const bk = bakedAt(gx, gz, F);                            // baked brightness for this cell (floor + ceiling share it)
-    if (floorSolidAt(gx, gz, F)) floors.push({ x: cxw, z: czw, y: y0, bk });
+    if (floorSolidAt(gx, gz, F)) {                            // theme 0 = carpet slab; 1..3 = concrete-top slab + a tile surface
+      const ft = floorThemeAt(gx, gz), th = tileFloorGeo[ft] ? ft : 0;   // fall back to carpet if that tile model didn't load
+      if (th === 0) floors.push({ x: cxw, z: czw, y: y0, bk });
+      else { floorsConc.push({ x: cxw, z: czw, y: y0, bk }); floorTiles[th].push({ x: cxw, z: czw, y: y0, bk }); }
+    }
     if (!stairCutCell(gx, gz, F)) {                            // leave the stair's emergence cells open to the floor above
       ceils.push({ x: cxw, z: czw, y: ceilY, lampK: lampBrokenAt(gx, gz, F) ? 0.4 : 1.0, bk }); // dim under dead lights
       if ((gx & 1) === 0 && (gz & 1) === 0) {                  // one fixture every other cell, hung just under the ceiling
@@ -1159,7 +1177,11 @@ function buildChunkFloor(cx, cz, F) {
       }
     }
 
-  if (floors.length) group.add(instanced(slabGeo, slabMats, floors, (d, it) => { d.position.set(it.x, it.y - SLAB / 2, it.z); d.rotation.set(0, 0, 0); d.scale.set(1, 1, 1); }, it => [1, it.bk, 1])); // slab top sits at it.y; .g = baked light
+  const slabPlace = (d, it) => { d.position.set(it.x, it.y - SLAB / 2, it.z); d.rotation.set(0, 0, 0); d.scale.set(1, 1, 1); };
+  if (floors.length) group.add(instanced(slabGeo, slabMats, floors, slabPlace, it => [1, it.bk, 1]));         // carpet-top slab (theme 0). slab top sits at it.y; .g = baked light
+  if (floorsConc.length) group.add(instanced(slabGeo, slabConcreteMats, floorsConc, slabPlace, it => [1, it.bk, 1])); // concrete-top slab under the tile themes (keeps concrete sides + underside = ceiling structure)
+  for (let t = 1; t <= 3; t++) if (floorTiles[t].length && tileFloorGeo[t])   // tile surface sits flush on the slab top (model is its own ~4 m square; .g = baked light)
+    group.add(instanced(tileFloorGeo[t], tileFloorMat[t], floorTiles[t], (d, it) => { d.position.set(it.x, it.y + 0.006, it.z); d.rotation.set(0, 0, 0); d.scale.set(1, 1, 1); }, it => [1, it.bk, 1]));
   if (ceils.length)  group.add(instanced(planeGeo, ceilMat,  ceils,  (d, it) => { d.position.set(it.x, it.y, it.z); d.rotation.set(Math.PI / 2, 0, 0); d.scale.set(1, 1, 1); }, it => [it.lampK, it.bk, 1]));
   // walls: GLB origin is bottom-centred (foot at yb, scaled to cell width CELL/WALL_GLB_W & segment height
   // h/WALL_GLB_H, same yaw rule as the box wall). The box path centres the segment and caps the top at the
@@ -1828,7 +1850,18 @@ const stairLoad = Promise.all([loadGLB('stairs_mp_1.glb'), loadGLB('stairs_5_con
   if (stairsSMat = s5.mat) installPoolLight(stairsSMat);
   stairsWGeo = sw.geo; stairsSGeo = s5.geo;                 // set LAST: instances only emit once both are valid
 }).catch(err => { stairsWGeo = stairsSGeo = null; console.error('stair models failed to load — stairs are invisible but still walkable:', err); });
-Promise.all([loadGLB('ceiling_lamp_4_on.glb'), loadGLB('ceiling_lamp_4_off.glb'), structLoad, stairLoad])
+// Floor-tile themes (floor_ceiling_1/2/3.glb): each contributes one of the 3 non-carpet floor themes. Each
+// is independently optional — a load failure leaves that theme's areas on the default carpet.
+const FLOOR_TILE_DEFS = [['floor_ceiling_1.glb', 'floor_1'], ['floor_ceiling_2.glb', 'tiles_floor_1'], ['floor_ceiling_3.glb', 'floor_2']];
+const floorTileLoad = Promise.all(FLOOR_TILE_DEFS.map(([file, matName], i) =>
+  loadGLB(file).then(g => {
+    const f = geoByMaterial(g, matName);
+    if (!f.geo) throw new Error(file + ' missing a ' + matName + ' mesh');
+    if (tileFloorMat[i + 1] = f.mat) installPoolLight(tileFloorMat[i + 1]);   // baked lamp-pool light, same as the carpet
+    tileFloorGeo[i + 1] = f.geo;                                              // set LAST: areas only switch to this tile once its geo is valid
+  }).catch(err => { tileFloorGeo[i + 1] = null; console.error(file + ' floor tile disabled (its areas use the default carpet):', err); })
+));
+Promise.all([loadGLB('ceiling_lamp_4_on.glb'), loadGLB('ceiling_lamp_4_off.glb'), structLoad, stairLoad, floorTileLoad])
   .then(([onGltf, offGltf]) => {
     const on = lampFromGltf(onGltf), off = lampFromGltf(offGltf);
     lampOnGeo = on.geo; lampOnMat = on.mat; installLampFlicker(lampOnMat);
